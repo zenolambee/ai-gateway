@@ -16,7 +16,8 @@ app.use(express.urlencoded({ extended: true }));
 
 // Logging
 if (process.env.NODE_ENV !== 'test') {
-  app.use(morgan('combined'));
+  const morganFormat = process.env.NODE_ENV === 'production' ? 'combined' : 'dev';
+  app.use(morgan(morganFormat));
 }
 
 // Routes
