@@ -1,0 +1,5 @@
+
+### `GET /v1/models`
+Returns the list of configured models.
+
+**Response (200):**
