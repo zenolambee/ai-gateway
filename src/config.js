@@ -13,6 +13,8 @@ const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
   version: process.env.VERSION || '1.0.0',
   modelsList,
+  aiApiUrl: process.env.AI_API_URL || 'https://api.deepseek.com/v1/chat/completions',
+  aiApiKey: process.env.AI_API_KEY || '',
 };
 
 module.exports = config;
