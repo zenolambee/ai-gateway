@@ -3,8 +3,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const routes = require('./routes');
-const errorHandler = require('./middleware/errorHandler');
-const notFoundHandler = require('./middleware/notFound');
+const { errorHandler, notFoundHandler } = require('./middleware');
 
 const app = express();
 
