@@ -1,7 +1,2 @@
 
-## API Endpoints
-
-### `GET /health`
-Returns the service status.
-
-**Response (200):**
+If `AI_API_KEY` is missing, the server will exit immediately with:
