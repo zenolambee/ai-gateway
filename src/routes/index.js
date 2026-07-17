@@ -4,7 +4,9 @@ const healthRoute = require('./health');
 const generateRoute = require('./generate');
 const modelsRoute = require('./models');
 const infoRoute = require('./info');
+const rootRoute = require('./root');
 
+router.use('/', rootRoute);
 router.use('/health', healthRoute);
 router.use('/api/v1/generate', generateRoute);
 router.use('/v1/models', modelsRoute);

@@ -1,6 +1,12 @@
 const app = require('./app');
 const config = require('./config');
 
+// Validate critical environment configuration
+if (!config.aiApiKey) {
+  console.error('FATAL: AI_API_KEY environment variable is not set. Aborting.');
+  process.exit(1);
+}
+
 const server = app.listen(config.port, () => {
   console.log(`AI Gateway running on port ${config.port}`);
 });
