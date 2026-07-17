@@ -15,6 +15,7 @@ const config = {
   modelsList,
   aiApiUrl: process.env.AI_API_URL || 'https://api.deepseek.com/v1/chat/completions',
   aiApiKey: process.env.AI_API_KEY || '',
+  aiModel: process.env.AI_MODEL || 'deepseek-v4-flash',
 };
 
 module.exports = config;
