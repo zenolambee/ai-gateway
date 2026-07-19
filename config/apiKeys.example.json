@@ -1,0 +1,48 @@
+[
+  {
+    "id": "admin-key",
+    "key": "sk-gateway-admin-change-me",
+    "name": "Admin key",
+    "status": "active",
+    "role": "admin",
+    "createdAt": 1700000000
+  },
+  {
+    "id": "default-key",
+    "key": "sk-gateway-default-key-change-me",
+    "name": "Default key",
+    "status": "active",
+    "createdAt": 1700000000
+  },
+  {
+    "id": "readonly-key",
+    "key": "sk-gateway-readonly-change-me",
+    "name": "Read-only key (models only)",
+    "status": "active",
+    "allowedModels": ["gpt-4o", "gpt-4o-mini"],
+    "createdAt": 1700000000
+  },
+  {
+    "id": "limited-key",
+    "key": "sk-gateway-limited-change-me",
+    "name": "Provider-limited key",
+    "status": "active",
+    "allowedProviders": ["openai", "deepseek"],
+    "createdAt": 1700000000
+  },
+  {
+    "id": "expired-key",
+    "key": "sk-gateway-expired-change-me",
+    "name": "Expired key",
+    "status": "active",
+    "expiresAt": 1000000000,
+    "createdAt": 999999999
+  },
+  {
+    "id": "disabled-key",
+    "key": "sk-gateway-disabled-change-me",
+    "name": "Disabled key",
+    "status": "inactive",
+    "createdAt": 1700000000
+  }
+]

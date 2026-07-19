@@ -1,0 +1,13 @@
+{
+  "id": "openrouter",
+  "name": "OpenRouter",
+  "enabled": false,
+  "adapter": "openrouter",
+  "baseURL": "https://openrouter.ai/api/v1",
+  "apiKeys": ["${OPENROUTER_API_KEY}"],
+  "supportedModels": ["openrouter/auto", "anthropic/claude-3.5-sonnet", "google/gemini-pro-1.5"],
+  "priority": 10,
+  "timeout": 60000,
+  "openrouterReferer": "https://github.com/your-org/ai-gateway",
+  "openrouterTitle": "AI Gateway"
+}

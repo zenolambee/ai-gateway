@@ -1,9 +1,0 @@
-
-- `PORT` – The port the server will listen on (default `3000`).
-- `NODE_ENV` – Environment (`development`, `production`, or `test`). Affects morgan log format and other behaviors.
-- `VERSION` – Version string returned in the health‑check response.
-- `MODELS_LIST` – A JSON array of model objects returned by the `/v1/models` endpoint. Each object must have at least `id` and `object` fields.
-
-## Running
-
-### Development (with auto‑restart via nodemon)

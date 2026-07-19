@@ -1,3 +1,8 @@
 node_modules/
 .env
 dist/
+.aider*
+
+# Logs (keep the folder, ignore generated log files)
+logs/*
+!logs/.gitkeep

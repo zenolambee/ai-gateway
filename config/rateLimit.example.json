@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "algorithm": "token_bucket",
+  "global": {
+    "requestsPerMinute": 1000,
+    "burst": 100,
+    "concurrent": 50
+  },
+  "perKey": {
+    "requestsPerMinute": 100,
+    "burst": 20,
+    "concurrent": 10,
+    "dailyRequestQuota": 10000,
+    "dailyTokenQuota": 1000000,
+    "monthlyTokenQuota": 30000000
+  },
+  "perProvider": {
+    "requestsPerMinute": 500,
+    "burst": 50,
+    "concurrent": 20
+  },
+  "perModel": {
+    "requestsPerMinute": 200,
+    "burst": 20
+  }
+}

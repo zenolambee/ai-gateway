@@ -1,0 +1,11 @@
+{
+  "id": "tokenfaucet",
+  "name": "TokenFaucet",
+  "enabled": false,
+  "adapter": "tokenfaucet",
+  "baseURL": "https://api.tokenfaucet.io/v1",
+  "apiKeys": ["${TOKENFAUCET_API_KEY}"],
+  "supportedModels": ["tf-llama-3-70b", "tf-mixtral-8x7b"],
+  "priority": 20,
+  "timeout": 30000
+}

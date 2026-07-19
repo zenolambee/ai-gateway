@@ -1,7 +1,0 @@
-
-## API Endpoints
-
-### `GET /`
-Returns basic information about the service and lists available endpoints.
-
-**Response (200):**

@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Gateway Admin Dashboard</title>
+<style>
+:root{--bg:#0b0d12;--card:#161924;--card2:#1d2030;--border:#2a2e3e;--text:#e2e4ea;--muted:#7a7f8e;--accent:#4a9eff;--accent-dim:rgba(74,158,255,.12);--green:#4caf50;--red:#f44336;--orange:#ff9800;--radius:10px;--shadow:0 2px 8px rgba(0,0,0,.3)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
+a{cursor:pointer}
+
+/* Layout */
+.header{background:var(--card);border-bottom:1px solid var(--border);padding:0 24px;display:flex;align-items:center;justify-content:space-between;height:56px;position:sticky;top:0;z-index:200;box-shadow:var(--shadow)}
+.header h1{font-size:17px;font-weight:600;display:flex;align-items:center;gap:8px}
+.header h1 .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
+.header .version{font-size:12px;color:var(--muted);font-weight:400}
+.nav{display:flex;gap:2px}
+.nav a{color:var(--muted);text-decoration:none;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:500;transition:all .12s;user-select:none}
+.nav a:hover{color:var(--text);background:rgba(255,255,255,.06)}
+.nav a.active{color:var(--accent);background:var(--accent-dim)}
+.container{max-width:1440px;margin:0 auto;padding:20px}
+.tab{display:none}.tab.active{display:block}
+
+/* Cards */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;transition:border-color .15s}
+.card:hover{border-color:var(--accent)}
+.card .label{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:6px;font-weight:600}
+.card .value{font-size:22px;font-weight:700;letter-spacing:-.5px}
+.card .sub{font-size:11px;color:var(--muted);margin-top:3px}
+.card .value.green{color:var(--green)}.card .value.red{color:var(--red)}.card .value.orange{color:var(--orange)}.card .value.blue{color:var(--accent)}
+
+/* Sections */
+.section{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:20px;overflow:hidden}
+.section-hdr{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.section-hdr h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+.section-body{padding:16px}
+
+/* Table */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:10px 12px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border);text-transform:uppercase;font-size:10px;letter-spacing:.5px;white-space:nowrap}
+td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+
+/* Badges */
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap}
+.badge.green{background:rgba(76,175,80,.15);color:var(--green)}
+.badge.red{background:rgba(244,67,54,.15);color:var(--red)}
+.badge.orange{background:rgba(255,152,0,.15);color:var(--orange)}
+.badge.blue{background:rgba(74,158,255,.15);color:var(--accent)}
+.badge.gray{background:rgba(255,255,255,.08);color:var(--muted)}
+
+/* Buttons */
+.btn{background:var(--accent);color:#fff;border:none;padding:7px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;transition:opacity .12s;white-space:nowrap}
+.btn:hover{opacity:.85}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.red{background:var(--red)}.btn.green{background:var(--green)}.btn.gray{background:var(--card2);color:var(--text);border:1px solid var(--border)}
+.btn.sm{padding:4px 12px;font-size:12px}
+.btn.xs{padding:2px 8px;font-size:11px}
+
+/* Inputs */
+input,select,textarea{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:13px;outline:none;transition:border-color .15s;width:100%}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+input[type=checkbox]{width:auto}
+
+/* Toolbar */
+.toolbar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.toolbar .spacer{flex:1}
+.filters select,.filters input{width:auto;min-width:140px}
+
+/* Log */
+#logList{max-height:500px;overflow-y:auto;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg)}
+.log-row{padding:5px 12px;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center}
+.log-row:hover{background:rgba(255,255,255,.03)}
+.log-time{color:var(--muted);white-space:nowrap;min-width:65px}
+.log-status{font-weight:700;min-width:30px;text-align:center}
+.log-status.s2{color:var(--green)}.log-status.s4{color:var(--orange)}.log-status.s5{color:var(--red)}
+.log-model{color:var(--accent);min-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.log-provider{color:var(--muted);min-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.log-latency{color:var(--muted);min-width:55px;text-align:right}
+.log-key{color:var(--muted);min-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.log-empty{padding:24px;color:var(--muted);text-align:center}
+
+/* Chart */
+.chart-wrap{position:relative;height:180px;margin:8px 0}
+canvas.chart{width:100%;height:100%}
+
+/* Modal */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:300;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);max-width:560px;width:100%;max-height:85vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal-hdr{padding:16px 20px;border-bottom:1px solid var(--border);font-size:15px;font-weight:600}
+.modal-body{padding:20px;display:flex;flex-direction:column;gap:14px}
+.modal-ftr{padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px}
+.form-group label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:5px;font-weight:600}
+.form-group .hint{font-size:11px;color:var(--muted);margin-top:4px}
+.form-row{display:flex;gap:12px}
+.form-row .form-group{flex:1}
+
+/* Toast */
+#toast{position:fixed;bottom:20px;right:20px;z-index:400;display:flex;flex-direction:column;gap:8px}
+.toast{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:12px 20px;font-size:13px;box-shadow:var(--shadow);animation:slideIn .2s ease;max-width:380px}
+.toast.success{border-color:var(--green)}.toast.error{border-color:var(--red)}.toast.info{border-color:var(--accent)}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+/* Loading */
+.loading{display:flex;align-items:center;justify-content:center;padding:40px}
+.spinner{width:24px;height:24px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Capabilities */
+.cap-grid{display:flex;flex-wrap:wrap;gap:4px}
+.cap{font-size:10px;padding:2px 8px;border-radius:4px;background:var(--accent-dim);color:var(--accent);font-weight:500}
+
+/* Responsive */
+@media(max-width:768px){
+  .header{padding:0 12px;flex-wrap:wrap;height:auto;gap:8px}
+  .nav{overflow-x:auto;width:100%;padding-bottom:4px}
+  .nav a{padding:6px 10px;font-size:12px;white-space:nowrap}
+  .container{padding:12px}
+  .cards{grid-template-columns:repeat(2,1fr)}
+  table{font-size:12px}
+  th,td{padding:6px 8px}
+}
+
+/* Config editor */
+.config-area{width:100%;min-height:400px;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:12px;resize:vertical}
+.config-err{color:var(--red);font-size:12px;padding:8px 0}
+.config-ok{color:var(--green);font-size:12px;padding:8px 0}
+
+/* Misc */
+.clickable{cursor:pointer;color:var(--accent);text-decoration:underline}
+.muted{color:var(--muted)}
+.mono{font-family:'SF Mono',Monaco,Consolas,monospace}
+.nowrap{white-space:nowrap}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span class="dot"></span> AI Gateway Admin <span class="version" id="hdrVersion"></span></h1>
+  <div class="nav" id="nav">
+    <a class="active" data-tab="overview">Overview</a>
+    <a data-tab="providers">Providers</a>
+    <a data-tab="keys">API Keys</a>
+    <a data-tab="models">Models</a>
+    <a data-tab="logs">Logs</a>
+    <a data-tab="health">Health</a>
+    <a data-tab="config">Config</a>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- OVERVIEW -->
+  <div class="tab active" id="tab-overview">
+    <div class="cards" id="overviewCards"></div>
+    <div class="section">
+      <div class="section-hdr"><h2>Request Rate (per 5s)</h2></div>
+      <div class="section-body"><div class="chart-wrap"><canvas class="chart" id="chartRate"></canvas></div></div>
+    </div>
+    <div class="section">
+      <div class="section-hdr"><h2>Latency Distribution (ms)</h2></div>
+      <div class="section-body"><div class="chart-wrap"><canvas class="chart" id="chartLatency"></canvas></div></div>
+    </div>
+  </div>
+
+  <!-- PROVIDERS -->
+  <div class="tab" id="tab-providers">
+    <div class="section">
+      <div class="section-hdr"><h2>Providers</h2><div><button class="btn sm" onclick="reloadConfig()">Reload All</button></div></div>
+      <div class="section-body">
+        <div id="providersLoading" class="loading"><div class="spinner"></div></div>
+        <table id="providersTable" style="display:none">
+          <thead><tr><th>ID</th><th>Name</th><th>Enabled</th><th>Priority</th><th>Adapter</th><th>Endpoint</th><th>Models</th><th>Health</th><th>Actions</th></tr></thead>
+          <tbody id="providersBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- API KEYS -->
+  <div class="tab" id="tab-keys">
+    <div class="section">
+      <div class="section-hdr"><h2>API Keys</h2><button class="btn sm" onclick="showCreateKeyModal()">+ Create Key</button></div>
+      <div class="section-body">
+        <div class="toolbar">
+          <input id="keySearch" placeholder="Search by name, role, or status..." style="max-width:300px" oninput="renderKeys()">
+        </div>
+        <div id="keysLoading" class="loading"><div class="spinner"></div></div>
+        <table id="keysTable" style="display:none">
+          <thead><tr><th>Name</th><th>Role</th><th>Status</th><th>Providers</th><th>Models</th><th>Requests</th><th>Tokens</th><th>Actions</th></tr></thead>
+          <tbody id="keysBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODELS -->
+  <div class="tab" id="tab-models">
+    <div class="section">
+      <div class="section-hdr"><h2>Model Registry</h2><button class="btn sm" onclick="loadModels()">Refresh</button></div>
+      <div class="section-body">
+        <div id="modelsLoading" class="loading"><div class="spinner"></div></div>
+        <table id="modelsTable" style="display:none">
+          <thead><tr><th>Model</th><th>Providers</th><th>Capabilities</th><th>Owned By</th></tr></thead>
+          <tbody id="modelsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOGS -->
+  <div class="tab" id="tab-logs">
+    <div class="section">
+      <div class="section-hdr">
+        <h2>Request Log</h2>
+        <div>
+          <button class="btn sm gray" id="logPauseBtn" onclick="togglePauseLogs()">Pause</button>
+          <button class="btn sm gray" onclick="copyLogs()">Copy</button>
+          <button class="btn sm red" onclick="clearLogs()">Clear</button>
+        </div>
+      </div>
+      <div class="section-body">
+        <div class="toolbar filters">
+          <select id="logFilterProvider" onchange="refreshLogs()"><option value="">All Providers</option></select>
+          <select id="logFilterStatus" onchange="refreshLogs()"><option value="">All Status</option><option value="2">2xx Success</option><option value="4">4xx Client Error</option><option value="5">5xx Server Error</option></select>
+          <input id="logFilterModel" placeholder="Filter by model..." oninput="refreshLogs()">
+        </div>
+        <div id="logList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HEALTH -->
+  <div class="tab" id="tab-health">
+    <div class="cards" id="healthCards"></div>
+    <div class="section">
+      <div class="section-hdr"><h2>Provider Health</h2></div>
+      <div class="section-body">
+        <table><thead><tr><th>Provider</th><th>Online</th><th>Circuit</th><th>Consecutive Failures</th><th>Success Rate</th><th>Avg Latency</th><th>Last Success</th><th>Last Failure</th></tr></thead><tbody id="healthBody"></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONFIG -->
+  <div class="tab" id="tab-config">
+    <div class="section">
+      <div class="section-hdr"><h2>Provider Configuration (JSON)</h2><div><button class="btn sm green" onclick="saveConfig()">Save & Reload</button><button class="btn sm gray" onclick="loadConfig()" style="margin-left:8px">Reset</button></div></div>
+      <div class="section-body">
+        <div id="configErr" class="config-err" style="display:none"></div>
+        <textarea class="config-area" id="configEditor" spellcheck="false"></textarea>
+        <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center">
+          <span class="muted" style="font-size:12px">Edit the JSON and click Save. The gateway validates before applying — invalid config is rolled back.</span>
+          <span class="muted" id="reloadStats" style="font-size:12px"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Modal Container -->
+<div id="modalContainer"></div>
+
+<!-- Toast Container -->
+<div id="toast"></div>
+
+<script>
+'use strict';
+
+// ============================================================
+// State
+// ============================================================
+const API = '/admin/api';
+var currentTab = 'overview';
+var logPaused = false;
+var logAutoRefresh = null;
+var overviewHistory = [];
+var rateHistory = [];
+var prevRequests = 0;
+var _keysData = [];
+var _providersData = [];
+
+// ============================================================
+// Utilities
+// ============================================================
+function fmt(n) { return typeof n === 'number' ? n.toLocaleString() : (n || '—'); }
+function fmtMs(n) { if (!n) return '—'; return n >= 1000 ? (n/1000).toFixed(1)+'s' : n+'ms'; }
+function fmtBytes(n) { if(!n) return '0'; const u=['B','KB','MB','GB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++} return n.toFixed(1)+' '+u[i]; }
+function fmtUptime(ms) { if(!ms) return '—'; const s=Math.floor(ms/1000); const d=Math.floor(s/86400); const h=Math.floor((s%86400)/3600); const m=Math.floor((s%3600)/60); if(d>0) return d+'d '+h+'h'; if(h>0) return h+'h '+m+'m'; return m+'m'; }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+async function api(path, opts) {
+  try {
+    const res = await fetch(API + path, opts);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error ? data.error.message : 'HTTP ' + res.status);
+    return data;
+  } catch(e) {
+    throw e;
+  }
+}
+
+function toast(msg, type) {
+  type = type || 'info';
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(function() { el.remove(); }, 4000);
+}
+
+function showLoading(id) { var el = document.getElementById(id); if(el) el.style.display='flex'; }
+function hideLoading(id) { var el = document.getElementById(id); if(el) el.style.display='none'; }
+
+// ============================================================
+// Tab Navigation (SPA)
+// ============================================================
+document.querySelectorAll('.nav a').forEach(function(a) {
+  a.addEventListener('click', function(e) {
+    e.preventDefault();
+    switchTab(a.dataset.tab);
+  });
+});
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+  var el = document.getElementById('tab-' + tab);
+  if (el) el.classList.add('active');
+  document.querySelectorAll('.nav a').forEach(function(a) { a.classList.toggle('active', a.dataset.tab === tab); });
+
+  // Stop log auto-refresh when leaving logs tab
+  if (tab !== 'logs' && logAutoRefresh) { clearInterval(logAutoRefresh); logAutoRefresh = null; }
+
+  // Load data for the tab
+  if (tab === 'overview') loadOverview();
+  if (tab === 'providers') loadProviders();
+  if (tab === 'keys') loadKeys();
+  if (tab === 'models') loadModels();
+  if (tab === 'logs') { refreshLogs(); startLogAutoRefresh(); }
+  if (tab === 'health') loadHealth();
+  if (tab === 'config') loadConfig();
+}
+
+// ============================================================
+// Charts (lightweight canvas — no dependencies)
+// ============================================================
+function drawChart(canvasId, labels, values, color) {
+  var c = document.getElementById(canvasId);
+  if (!c) return;
+  var ctx = c.getContext('2d');
+  var dpr = window.devicePixelRatio || 1;
+  var w = c.clientWidth * dpr;
+  var h = c.clientHeight * dpr;
+  c.width = w; c.height = h;
+  ctx.clearRect(0, 0, w, h);
+
+  if (!values || values.length === 0) {
+    ctx.fillStyle = '#7a7f8e';
+    ctx.font = 14 * dpr + 'px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No data', w/2, h/2);
+    return;
+  }
+
+  var max = Math.max.apply(null, values) || 1;
+  var padding = 10 * dpr;
+  var chartW = w - padding * 2;
+  var chartH = h - padding * 2;
+  var barW = values.length > 1 ? chartW / values.length : chartW / 4;
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,.05)';
+  ctx.lineWidth = 1;
+  for (var i = 0; i <= 4; i++) {
+    var gy = padding + (chartH / 4) * i;
+    ctx.beginPath(); ctx.moveTo(padding, gy); ctx.lineTo(w - padding, gy); ctx.stroke();
+  }
+
+  // Bars / line
+  ctx.strokeStyle = color || '#4a9eff';
+  ctx.fillStyle = color || '#4a9eff';
+  ctx.lineWidth = 2 * dpr;
+
+  if (values.length === 1) {
+    // Single value — draw a bar
+    var bh = (values[0] / max) * chartH;
+    ctx.fillRect(padding, h - padding - bh, barW, bh);
+  } else {
+    // Line chart
+    ctx.beginPath();
+    for (var i = 0; i < values.length; i++) {
+      var x = padding + (chartW / (values.length - 1)) * i;
+      var y = h - padding - (values[i] / max) * chartH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // Fill under the line
+    ctx.lineTo(padding + chartW, h - padding);
+    ctx.lineTo(padding, h - padding);
+    ctx.closePath();
+    ctx.fillStyle = (color || '#4a9eff') + '20';
+    ctx.fill();
+    // Points
+    ctx.fillStyle = color || '#4a9eff';
+    for (var i = 0; i < values.length; i++) {
+      var x = padding + (chartW / (values.length - 1)) * i;
+      var y = h - padding - (values[i] / max) * chartH;
+      ctx.beginPath(); ctx.arc(x, y, 2.5 * dpr, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+// ============================================================
+// Overview Tab
+// ============================================================
+async function loadOverview() {
+  try {
+    var [d, sys] = await Promise.all([api('/overview'), api('/system')]);
+    document.getElementById('hdrVersion').textContent = 'v' + sys.version;
+
+    // Calculate requests per second
+    var now = Date.now();
+    var rps = 0;
+    if (overviewHistory.length > 0) {
+      var prev = overviewHistory[overviewHistory.length - 1];
+      var dt = (now - prev.ts) / 1000;
+      if (dt > 0) rps = (d.requests - prev.requests) / dt;
+    }
+    overviewHistory.push({ ts: now, requests: d.requests });
+    if (overviewHistory.length > 60) overviewHistory.shift();
+    rateHistory.push(Math.round(rps * 10) / 10);
+    if (rateHistory.length > 30) rateHistory.shift();
+    prevRequests = d.requests;
+
+    var cards = [
+      ['Total Requests', fmt(d.requests), '', 'blue'],
+      ['Successful', fmt(d.successfulRequests), '', 'green'],
+      ['Errors', fmt(d.failedRequests), '', 'red'],
+      ['Tokens', fmt(d.tokens), fmt(d.promptTokens)+' prompt / '+fmt(d.completionTokens)+' completion', 'blue'],
+      ['Cost', '$'+(d.cost||0).toFixed(4), '', ''],
+      ['Active Providers', d.activeProviders, d.disabledProviders+' disabled', 'green'],
+      ['Healthy Providers', d.healthyProviders, '', 'green'],
+      ['Active API Keys', d.activeApiKeys, '', 'blue'],
+      ['Rate Limited', fmt(d.rateLimitRejections), '', 'red'],
+      ['Avg Latency', fmtMs(d.averageLatencyMs), 'p50 '+fmtMs(d.p50LatencyMs)+' / p95 '+fmtMs(d.p95LatencyMs), 'orange'],
+      ['Retries', fmt(d.retryCount), '', 'orange'],
+      ['Fallbacks', fmt(d.fallbackCount), '', 'orange'],
+      ['Uptime', fmtUptime(d.uptimeMs), '', ''],
+      ['Version', sys.version, sys.nodeVersion, ''],
+      ['Requests/sec', rps.toFixed(1), '', 'blue'],
+      ['Memory (RSS)', fmtBytes(sys.memory.rss), 'Heap '+fmtBytes(sys.memory.heapUsed), '']
+    ];
+    document.getElementById('overviewCards').innerHTML = cards.map(function(c) {
+      return '<div class="card"><div class="label">'+c[0]+'</div><div class="value '+c[3]+'">'+c[1]+'</div><div class="sub">'+(c[2]||'')+'</div></div>';
+    }).join('');
+
+    // Draw charts
+    drawChart('chartRate', rateHistory.map(function(_, i) { return i; }), rateHistory, '#4a9eff');
+    var latVals = [d.p50LatencyMs, d.p95LatencyMs, d.p99LatencyMs];
+    drawChart('chartLatency', ['p50','p95','p99'], latVals, '#ff9800');
+  } catch(e) {
+    toast('Failed to load overview: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// Providers Tab
+// ============================================================
+async function loadProviders() {
+  showLoading('providersLoading');
+  try {
+    var d = await api('/providers');
+    _providersData = d.providers;
+    hideLoading('providersLoading');
+    document.getElementById('providersTable').style.display = '';
+    document.getElementById('providersBody').innerHTML = d.providers.map(function(p) {
+      var models = (p.supportedModels || []).join(', ');
+      var health = p.health ? '<span class="badge '+(p.health.online?'green':'red')+'">'+esc(p.health.circuitState)+'</span>' : '<span class="badge gray">—</span>';
+      var enableBtn = p.enabled
+        ? '<button class="btn xs red" onclick="toggleProvider(\''+esc(p.id)+'\',false)">Disable</button>'
+        : '<button class="btn xs green" onclick="toggleProvider(\''+esc(p.id)+'\',true)">Enable</button>';
+      return '<tr>'
+        + '<td class="mono">'+esc(p.id)+'</td>'
+        + '<td>'+esc(p.name)+'</td>'
+        + '<td><span class="badge '+(p.enabled?'green':'red')+'">'+(p.enabled?'enabled':'disabled')+'</span></td>'
+        + '<td>'+p.priority+'</td>'
+        + '<td><span class="badge blue">'+esc(p.adapter||'generic-openai')+'</span></td>'
+        + '<td class="mono" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis">'+esc(p.baseURL)+'</td>'
+        + '<td style="font-size:11px">'+esc(models)+'</td>'
+        + '<td>'+health+'</td>'
+        + '<td class="nowrap">'+enableBtn+' <button class="btn xs gray" onclick="testProvider(\''+esc(p.id)+'\')">Test</button></td>'
+        + '</tr>';
+    }).join('');
+  } catch(e) {
+    toast('Failed to load providers: ' + e.message, 'error');
+  }
+}
+
+async function toggleProvider(id, enable) {
+  try {
+    var p = _providersData.find(function(x) { return x.id === id; });
+    if (!p) throw new Error('Provider not found');
+    await api('/providers/'+encodeURIComponent(id), {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(Object.assign({}, p, {enabled: enable}))
+    });
+    toast('Provider "'+id+'" '+(enable?'enabled':'disabled'), 'success');
+    loadProviders();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function testProvider(id) {
+  toast('Testing provider "'+id+'"...', 'info');
+  try {
+    var r = await api('/providers/'+encodeURIComponent(id)+'/test', {method: 'POST'});
+    if (r.success) toast('Provider "'+id+'" reachable ('+r.latencyMs+'ms)', 'success');
+    else toast('Provider "'+id+'" test failed: '+(r.error||'unknown'), 'error');
+  } catch(e) {
+    toast('Test failed: ' + e.message, 'error');
+  }
+}
+
+async function reloadConfig() {
+  toast('Reloading configuration...', 'info');
+  try {
+    var r = await api('/reload', {method: 'POST'});
+    if (r.success) toast('Configuration reloaded successfully', 'success');
+    else toast('Reload failed: '+(r.errors||[]).join('; '), 'error');
+    if (currentTab === 'providers') loadProviders();
+  } catch(e) {
+    toast('Reload failed: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// API Keys Tab
+// ============================================================
+async function loadKeys() {
+  showLoading('keysLoading');
+  try {
+    var d = await api('/keys');
+    _keysData = d.keys;
+    hideLoading('keysLoading');
+    document.getElementById('keysTable').style.display = '';
+    renderKeys();
+  } catch(e) {
+    toast('Failed to load API keys: ' + e.message, 'error');
+  }
+}
+
+function renderKeys() {
+  var search = (document.getElementById('keySearch').value || '').toLowerCase();
+  var keys = _keysData.filter(function(k) {
+    if (!search) return true;
+    return (k.name||'').toLowerCase().includes(search) || (k.role||'').toLowerCase().includes(search) || (k.status||'').toLowerCase().includes(search);
+  });
+  document.getElementById('keysBody').innerHTML = keys.map(function(k) {
+    var provs = k.allowedProviders ? esc(k.allowedProviders.join(', ')) : '<span class="muted">All</span>';
+    var models = k.allowedModels ? esc(k.allowedModels.join(', ')) : '<span class="muted">All</span>';
+    var exp = k.expiresAt ? new Date(k.expiresAt * 1000).toLocaleDateString() : '—';
+    var toggleBtn = k.status === 'active'
+      ? '<button class="btn xs red" onclick="toggleKey(\''+esc(k.id)+'\',\'inactive\')">Disable</button>'
+      : '<button class="btn xs green" onclick="toggleKey(\''+esc(k.id)+'\',\'active\')">Enable</button>';
+    return '<tr>'
+      + '<td><strong>'+esc(k.name)+'</strong><br><small class="muted mono">'+esc(k.keyPrefix)+'</small></td>'
+      + '<td><span class="badge '+(k.role==='admin'?'orange':'gray')+'">'+esc(k.role||'user')+'</span></td>'
+      + '<td><span class="badge '+(k.status==='active'?'green':'red')+'">'+esc(k.status)+'</span></td>'
+      + '<td style="font-size:11px">'+provs+'</td>'
+      + '<td style="font-size:11px">'+models+'</td>'
+      + '<td>'+fmt(k.usage?k.usage.totalRequests:0)+'</td>'
+      + '<td>'+fmt(k.usage?k.usage.totalTokens:0)+'</td>'
+      + '<td class="nowrap">'+toggleBtn+' <button class="btn xs red" onclick="deleteKey(\''+esc(k.id)+'\')">Delete</button></td>'
+      + '</tr>';
+  }).join('') || '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No keys found</td></tr>';
+}
+
+async function toggleKey(id, status) {
+  try {
+    await api('/keys/'+encodeURIComponent(id), {
+      method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({status: status})
+    });
+    toast('Key "'+id+'" '+status, 'success');
+    loadKeys();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function deleteKey(id) {
+  if (!confirm('Delete key "'+id+'"?')) return;
+  try {
+    await api('/keys/'+encodeURIComponent(id), {method: 'DELETE'});
+    toast('Key "'+id+'" deleted', 'success');
+    loadKeys();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+function showCreateKeyModal() {
+  var html = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">'
+    + '<div class="modal"><div class="modal-hdr">Create API Key</div><div class="modal-body">'
+    + '<div class="form-group"><label>Key *</label><input id="newKeyKey" placeholder="sk-..."></div>'
+    + '<div class="form-group"><label>Name</label><input id="newKeyName" placeholder="Key name"></div>'
+    + '<div class="form-row"><div class="form-group"><label>Role</label><select id="newKeyRole"><option value="user">user</option><option value="admin">admin</option></select></div>'
+    + '<div class="form-group"><label>Expires At (epoch seconds, optional)</label><input id="newKeyExp" type="number" placeholder="e.g. 1800000000"></div></div>'
+    + '<div class="form-group"><label>Allowed Providers (comma-separated, optional)</label><input id="newKeyProv" placeholder="openai, deepseek"></div>'
+    + '<div class="form-group"><label>Allowed Models (comma-separated, optional)</label><input id="newKeyModel" placeholder="gpt-4o, deepseek-chat"></div>'
+    + '</div><div class="modal-ftr"><button class="btn gray" onclick="closeModal()">Cancel</button><button class="btn" onclick="createKey()">Create</button></div></div></div>';
+  document.getElementById('modalContainer').innerHTML = html;
+}
+
+async function createKey() {
+  var key = document.getElementById('newKeyKey').value.trim();
+  var name = document.getElementById('newKeyName').value.trim();
+  var role = document.getElementById('newKeyRole').value;
+  var exp = document.getElementById('newKeyExp').value;
+  var prov = document.getElementById('newKeyProv').value.trim();
+  var model = document.getElementById('newKeyModel').value.trim();
+  if (!key) { toast('Key is required', 'error'); return; }
+  var body = { key: key, name: name || undefined, role: role };
+  if (exp) body.expiresAt = parseInt(exp, 10);
+  if (prov) body.allowedProviders = prov.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  if (model) body.allowedModels = model.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  try {
+    await api('/keys', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    toast('Key created', 'success');
+    closeModal();
+    loadKeys();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+function closeModal() { document.getElementById('modalContainer').innerHTML = ''; }
+
+// ============================================================
+// Models Tab
+// ============================================================
+async function loadModels() {
+  showLoading('modelsLoading');
+  try {
+    var d = await api('/models');
+    hideLoading('modelsLoading');
+    document.getElementById('modelsTable').style.display = '';
+    document.getElementById('modelsBody').innerHTML = d.models.map(function(m) {
+      var caps = Object.entries(m.capabilities || {}).filter(function(kv) { return kv[1]; }).map(function(kv) { return '<span class="cap">'+esc(kv[0])+'</span>'; }).join('');
+      var provs = (m.providers || []).map(function(p) { return '<span class="badge blue">'+esc(p)+'</span>'; }).join(' ');
+      var health = (m.health || []).map(function(h) { return '<span class="badge '+(h.online?'green':'red')+'">'+esc(h.providerId)+'</span>'; }).join(' ');
+      return '<tr>'
+        + '<td style="color:var(--accent);font-weight:600">'+esc(m.id)+'</td>'
+        + '<td>'+provs+'</td>'
+        + '<td><div class="cap-grid">'+caps+'</div></td>'
+        + '<td>'+health+'</td>'
+        + '</tr>';
+    }).join('') || '<tr><td colspan="4" class="muted" style="text-align:center;padding:24px">No models in registry</td></tr>';
+  } catch(e) {
+    toast('Failed to load models: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// Logs Tab
+// ============================================================
+function startLogAutoRefresh() {
+  if (logAutoRefresh) clearInterval(logAutoRefresh);
+  logAutoRefresh = setInterval(function() {
+    if (currentTab === 'logs' && !logPaused) refreshLogs();
+  }, 3000);
+}
+
+function togglePauseLogs() {
+  logPaused = !logPaused;
+  document.getElementById('logPauseBtn').textContent = logPaused ? 'Resume' : 'Pause';
+  document.getElementById('logPauseBtn').className = 'btn sm ' + (logPaused ? 'green' : 'gray');
+  if (!logPaused) refreshLogs();
+}
+
+async function refreshLogs() {
+  try {
+    var params = new URLSearchParams();
+    var p = document.getElementById('logFilterProvider').value;
+    var s = document.getElementById('logFilterStatus').value;
+    var m = document.getElementById('logFilterModel').value;
+    var url = '/logs?limit=200';
+    if (p) url += '&providerId=' + encodeURIComponent(p);
+    if (s) url += '&status=' + encodeURIComponent(s);
+    if (m) url += '&model=' + encodeURIComponent(m);
+    var d = await api(url);
+
+    // Populate provider filter options
+    var sel = document.getElementById('logFilterProvider');
+    if (sel.children.length <= 1) {
+      _providersData.forEach(function(p) {
+        var opt = document.createElement('option');
+        opt.value = p.id; opt.textContent = p.id;
+        sel.appendChild(opt);
+      });
+    }
+
+    var html = d.entries.map(function(e) {
+      var sc = Math.floor(e.status / 100);
+      return '<div class="log-row">'
+        + '<span class="log-time">'+new Date(e.timestamp).toISOString().slice(11,23)+'</span>'
+        + '<span class="log-status s'+sc+'">'+e.status+'</span>'
+        + '<span class="log-model">'+esc(e.model||'—')+'</span>'
+        + '<span class="log-provider">'+esc(e.providerId||'—')+'</span>'
+        + '<span class="log-key">'+esc(e.apiKeyId||'—')+'</span>'
+        + '<span class="log-latency">'+(e.latencyMs||0)+'ms</span>'
+        + '</div>';
+    }).join('');
+    document.getElementById('logList').innerHTML = html || '<div class="log-empty">No log entries</div>';
+  } catch(e) {
+    // silently fail to avoid toast spam on auto-refresh
+    if (!logPaused) console.error('Log refresh error:', e);
+  }
+}
+
+function copyLogs() {
+  var text = document.getElementById('logList').innerText;
+  navigator.clipboard.writeText(text).then(function() {
+    toast('Logs copied to clipboard', 'success');
+  }).catch(function() { toast('Copy failed', 'error'); });
+}
+
+function clearLogs() {
+  document.getElementById('logList').innerHTML = '<div class="log-empty">Log cleared (display only — server log is preserved)</div>';
+  toast('Log display cleared', 'info');
+}
+
+// ============================================================
+// Health Tab
+// ============================================================
+async function loadHealth() {
+  try {
+    var [h, sys] = await Promise.all([api('/health'), api('/system')]);
+    var providers = Object.values(h.providers || {});
+
+    // Summary cards
+    var online = providers.filter(function(p) { return p.online; }).length;
+    var total = providers.length;
+    var avgSuccess = total > 0 ? (providers.reduce(function(s, p) { return s + p.successRate; }, 0) / total).toFixed(1) : 100;
+    var cards = [
+      ['Online', online + '/' + total, '', online === total ? 'green' : 'orange'],
+      ['Avg Success Rate', avgSuccess + '%', '', 'green'],
+      ['Memory (Heap)', fmtBytes(sys.memory.heapUsed), 'of '+fmtBytes(sys.memory.heapTotal), ''],
+      ['Uptime', fmtUptime(sys.uptimeMs), '', ''],
+      ['Requests (total)', '—', 'see overview', 'blue'],
+      ['Node.js', sys.nodeVersion, '', '']
+    ];
+    document.getElementById('healthCards').innerHTML = cards.map(function(c) {
+      return '<div class="card"><div class="label">'+c[0]+'</div><div class="value '+c[3]+'">'+c[1]+'</div><div class="sub">'+(c[2]||'')+'</div></div>';
+    }).join('');
+
+    // Health table
+    document.getElementById('healthBody').innerHTML = providers.map(function(p) {
+      return '<tr>'
+        + '<td class="mono" style="font-weight:600">'+esc(p.providerId)+'</td>'
+        + '<td><span class="badge '+(p.online?'green':'red')+'">'+(p.online?'online':'offline')+'</span></td>'
+        + '<td><span class="badge '+(p.circuitState==='closed'?'green':p.circuitState==='open'?'red':'orange')+'">'+esc(p.circuitState)+'</span></td>'
+        + '<td>'+p.consecutiveFailures+'</td>'
+        + '<td>'+p.successRate+'%</td>'
+        + '<td>'+fmtMs(p.averageLatencyMs)+'</td>'
+        + '<td class="muted" style="font-size:11px">'+esc(p.lastSuccess||'—')+'</td>'
+        + '<td class="muted" style="font-size:11px">'+esc(p.lastFailure||'—')+'</td>'
+        + '</tr>';
+    }).join('') || '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No health data</td></tr>';
+  } catch(e) {
+    toast('Failed to load health: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// Config Tab
+// ============================================================
+var _originalConfig = '';
+
+async function loadConfig() {
+  try {
+    var d = await api('/config');
+    _originalConfig = JSON.stringify(d, null, 2);
+    document.getElementById('configEditor').value = _originalConfig;
+    document.getElementById('reloadStats').textContent = 'Reloads: ' + (d.reloadStats ? d.reloadStats.reloadCount : 0) + ' / Failures: ' + (d.reloadStats ? d.reloadStats.reloadFailures : 0);
+    document.getElementById('configErr').style.display = 'none';
+  } catch(e) {
+    toast('Failed to load config: ' + e.message, 'error');
+  }
+}
+
+async function saveConfig() {
+  var text = document.getElementById('configEditor').value;
+  var errEl = document.getElementById('configErr');
+  errEl.style.display = 'none';
+  errEl.textContent = '';
+
+  // Validate JSON locally first
+  var parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch(e) {
+    errEl.style.display = '';
+    errEl.textContent = 'Invalid JSON: ' + e.message;
+    toast('Invalid JSON — please fix syntax errors', 'error');
+    return;
+  }
+
+  if (!parsed.providers || !Array.isArray(parsed.providers)) {
+    errEl.style.display = '';
+    errEl.textContent = 'Configuration must have a "providers" array';
+    toast('Invalid config structure', 'error');
+    return;
+  }
+
+  toast('Saving configuration...', 'info');
+  try {
+    var r = await api('/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ providers: parsed.providers })
+    });
+    if (r.success) {
+      toast('Configuration saved and reloaded', 'success');
+      loadConfig();
+    } else {
+      errEl.style.display = '';
+      errEl.textContent = 'Validation failed: ' + (r.errors || []).join('; ');
+      toast('Configuration validation failed — rolled back', 'error');
+    }
+  } catch(e) {
+    errEl.style.display = '';
+    errEl.textContent = e.message;
+    toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// Init
+// ============================================================
+// Auto-refresh overview every 5s
+setInterval(function() {
+  if (currentTab === 'overview') loadOverview();
+  if (currentTab === 'health') loadHealth();
+}, 5000);
+
+// Load initial data
+loadOverview();
+</script>
+</body>
+</html>

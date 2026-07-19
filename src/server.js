@@ -1,11 +1,35 @@
 const app = require('./app');
 const config = require('./config');
+const logger = require('./utils/logger');
+const { providerManager, apiKeyManager, adapterRegistry } = require('./services');
 
 // Validate critical environment configuration
 if (!config.aiApiKey) {
   console.error('FATAL: AI_API_KEY environment variable is not set. Aborting.');
   process.exit(1);
 }
+
+// Load and validate AI provider configurations
+providerManager.load();
+
+// Load API keys for every provider into the ApiKeyManager
+apiKeyManager.load(providerManager.listProviders());
+
+// Reset the adapter cache so any changed provider config (e.g. an `adapter`
+// field) is picked up immediately after a reload.
+adapterRegistry.reset();
+
+logger.info('Loaded AI providers', {
+  total: providerManager.listProviders().length,
+  enabled: providerManager.getEnabledProviders().map((p) => ({
+    id: p.id,
+    name: p.name,
+    models: p.supportedModels,
+    priority: p.priority,
+    keys: p.apiKeys.length,
+    adapter: p.adapter || p.id,
+  })),
+});
 
 const server = app.listen(config.port, () => {
   console.log(`AI Gateway running on port ${config.port}`);

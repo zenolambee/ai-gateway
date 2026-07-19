@@ -1,0 +1,11 @@
+{
+  "id": "nvidia",
+  "name": "NVIDIA NIM",
+  "enabled": false,
+  "adapter": "nvidia",
+  "baseURL": "https://integrate.api.nvidia.com/v1",
+  "apiKeys": ["${NVIDIA_API_KEY}"],
+  "supportedModels": ["nvidia/llama-3.1-nemotron-70b-instruct", "nvidia/mistral-nemo-12b-instruct"],
+  "priority": 12,
+  "timeout": 45000
+}

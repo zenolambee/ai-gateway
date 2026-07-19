@@ -1,5 +1,0 @@
-
-### `GET /health`
-Returns the service status, server uptime, version, and timestamp.
-
-**Response (200):**

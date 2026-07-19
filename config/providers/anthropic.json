@@ -1,0 +1,12 @@
+{
+  "id": "anthropic",
+  "name": "Anthropic",
+  "enabled": false,
+  "adapter": "anthropic",
+  "baseURL": "https://api.anthropic.com/v1",
+  "apiKeys": ["${ANTHROPIC_API_KEY}"],
+  "supportedModels": ["claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku"],
+  "priority": 3,
+  "timeout": 60000,
+  "anthropicVersion": "2023-06-01"
+}

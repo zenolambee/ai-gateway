@@ -1,15 +1,31 @@
 const express = require('express');
 const router = express.Router();
 const healthRoute = require('./health');
+const readyRoute = require('./ready');
 const generateRoute = require('./generate');
 const modelsRoute = require('./models');
 const infoRoute = require('./info');
 const rootRoute = require('./root');
+const chatCompletionsRoute = require('./chatCompletions');
+const responsesRoute = require('./responses');
+const embeddingsRoute = require('./embeddings');
+const imagesRoute = require('./images');
+const audioRoute = require('./audio');
+const metricsRoute = require('./metrics');
 
 router.use('/', rootRoute);
 router.use('/health', healthRoute);
+router.use('/ready', readyRoute);
+router.use('/metrics', metricsRoute);
+router.use('/stats', metricsRoute);
+router.use('/health/providers', metricsRoute);
 router.use('/api/v1/generate', generateRoute);
 router.use('/v1/models', modelsRoute);
 router.use('/v1/info', infoRoute);
+router.use('/v1/chat/completions', chatCompletionsRoute);
+router.use('/v1/responses', responsesRoute);
+router.use('/v1/embeddings', embeddingsRoute);
+router.use('/v1/images', imagesRoute);
+router.use('/v1/audio', audioRoute);
 
 module.exports = router;

@@ -1,0 +1,12 @@
+{
+  "id": "databricks",
+  "name": "Databricks Model Serving",
+  "enabled": false,
+  "adapter": "databricks",
+  "baseURL": "https://<workspace>.cloud.databricks.com/serving-endpoints/<endpoint-name>",
+  "apiKeys": ["${DATABRICKS_TOKEN}"],
+  "supportedModels": ["databricks-dbrx-instruct", "databricks-mixtral-8x7b"],
+  "priority": 15,
+  "timeout": 60000,
+  "chatPath": "/chat/completions"
+}
