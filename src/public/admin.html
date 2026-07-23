@@ -148,6 +148,7 @@ canvas.chart{width:100%;height:100%}
     <a data-tab="models">Models</a>
     <a data-tab="logs">Logs</a>
     <a data-tab="health">Health</a>
+    <a data-tab="routing">Routing</a>
     <a data-tab="config">Config</a>
   </div>
 </div>
@@ -241,6 +242,42 @@ canvas.chart{width:100%;height:100%}
       <div class="section-hdr"><h2>Provider Health</h2></div>
       <div class="section-body">
         <table><thead><tr><th>Provider</th><th>Online</th><th>Circuit</th><th>Consecutive Failures</th><th>Success Rate</th><th>Avg Latency</th><th>Last Success</th><th>Last Failure</th></tr></thead><tbody id="healthBody"></tbody></table>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-hdr"><h2>Provider API Key Health</h2><select id="keyHealthProviderSelect" onchange="loadKeyHealth()" style="max-width:240px"></select></div>
+      <div class="section-body">
+        <div id="keyHealthLoading" class="loading"><div class="spinner"></div></div>
+        <table id="keyHealthTable" style="display:none">
+          <thead><tr><th>Key</th><th>Status</th><th>Priority</th><th>Weight</th><th>Requests</th><th>Success</th><th>Failures</th><th>Success Rate</th><th>Avg Latency</th><th>Tokens</th><th>Last Success</th><th>Last Failure</th><th>Cooldown Until</th><th>Actions</th></tr></thead>
+          <tbody id="keyHealthBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ROUTING -->
+  <div class="tab" id="tab-routing">
+    <div class="section">
+      <div class="section-hdr"><h2>Routing Strategy</h2></div>
+      <div class="section-body">
+        <div class="form-group" style="max-width:400px">
+          <label>Provider Routing Strategy</label>
+          <select id="routingStrategySelect"></select>
+          <div class="hint">Controls how the gateway orders candidate providers that support the requested model. Changes apply instantly (no restart).</div>
+        </div>
+        <div class="form-group" style="max-width:400px;margin-top:14px">
+          <label>Default Key Selection Strategy</label>
+          <select id="keyStrategySelect"></select>
+          <div class="hint">Controls how the gateway picks the next API key within a provider. Per-provider overrides below take precedence.</div>
+        </div>
+        <div style="margin-top:16px"><button class="btn" onclick="saveRouting()">Apply</button></div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-hdr"><h2>Per-Provider Key Selection Strategy</h2></div>
+      <div class="section-body">
+        <table><thead><tr><th>Provider</th><th>Strategy</th></tr></thead><tbody id="providerStrategyBody"></tbody></table>
       </div>
     </div>
   </div>
@@ -342,7 +379,8 @@ function switchTab(tab) {
   if (tab === 'keys') loadKeys();
   if (tab === 'models') loadModels();
   if (tab === 'logs') { refreshLogs(); startLogAutoRefresh(); }
-  if (tab === 'health') loadHealth();
+  if (tab === 'health') { loadHealth(); populateKeyHealthProviders(); }
+  if (tab === 'routing') loadRouting();
   if (tab === 'config') loadConfig();
 }
 
@@ -769,6 +807,124 @@ async function loadHealth() {
     }).join('') || '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No health data</td></tr>';
   } catch(e) {
     toast('Failed to load health: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// Provider Key Health (Sprint 9)
+// ============================================================
+function populateKeyHealthProviders() {
+  try {
+    var sel = document.getElementById('keyHealthProviderSelect');
+    if (!sel) return;
+    // Use the providers list from the providers tab data if available,
+    // otherwise fetch it.
+    if (_providersData && _providersData.length > 0) {
+      sel.innerHTML = _providersData.map(function(p) {
+        return '<option value="'+esc(p.id)+'">'+esc(p.id)+'</option>';
+      }).join('');
+      loadKeyHealth();
+      return;
+    }
+    api('/providers').then(function(d) {
+      _providersData = d.providers || [];
+      sel.innerHTML = _providersData.map(function(p) {
+        return '<option value="'+esc(p.id)+'">'+esc(p.id)+'</option>';
+      }).join('');
+      loadKeyHealth();
+    });
+  } catch(e) { /* ignore */ }
+}
+
+async function loadKeyHealth() {
+  var sel = document.getElementById('keyHealthProviderSelect');
+  if (!sel || !sel.value) return;
+  showLoading('keyHealthLoading');
+  try {
+    var d = await api('/providers/' + encodeURIComponent(sel.value) + '/keys');
+    hideLoading('keyHealthLoading');
+    document.getElementById('keyHealthTable').style.display = '';
+    document.getElementById('keyHealthBody').innerHTML = (d.keys || []).map(function(k) {
+      var s = k.stats || {};
+      var statusBadge = '<span class="badge '+(k.status==='ACTIVE'?'green':k.status==='COOLDOWN'||k.status==='RATE_LIMITED'?'orange':'red')+'">'+esc(k.status)+'</span>';
+      var cooldown = k.cooldownUntil ? esc(k.cooldownUntil) : '—';
+      var actions = '<button class="btn xs '+(k.status==='DISABLED'?'green':'red')+'" onclick="toggleProviderKey(\''+esc(sel.value)+'\',\''+esc(k.key)+'\','+(k.status==='DISABLED'?true:false)+')">'+(k.status==='DISABLED'?'Enable':'Disable')+'</button>';
+      return '<tr>'
+        + '<td class="mono">'+esc(k.key)+'</td>'
+        + '<td>'+statusBadge+'</td>'
+        + '<td>'+(k.priority||0)+'</td>'
+        + '<td>'+(k.weight||1)+'</td>'
+        + '<td>'+fmt(s.totalRequests)+'</td>'
+        + '<td>'+fmt(s.successCount)+'</td>'
+        + '<td>'+fmt(s.failureCount)+'</td>'
+        + '<td>'+(s.successRate!==undefined?s.successRate+'%':'—')+'</td>'
+        + '<td>'+fmtMs(s.averageLatencyMs)+'</td>'
+        + '<td>'+fmt(s.totalTokens)+'</td>'
+        + '<td class="muted" style="font-size:11px">'+esc(k.lastSuccess||'—')+'</td>'
+        + '<td class="muted" style="font-size:11px">'+esc(k.lastFailure||'—')+'</td>'
+        + '<td class="muted" style="font-size:11px">'+cooldown+'</td>'
+        + '<td class="nowrap">'+actions+'</td>'
+        + '</tr>';
+    }).join('') || '<tr><td colspan="14" class="muted" style="text-align:center;padding:24px">No keys configured</td></tr>';
+  } catch(e) {
+    hideLoading('keyHealthLoading');
+    toast('Failed to load key health: ' + e.message, 'error');
+  }
+}
+
+async function toggleProviderKey(providerId, maskedKey, enable) {
+  // The masked key cannot be used to disable/enable — we need the raw key.
+  // Prompt the admin to paste the raw key value.
+  var rawKey = prompt(enable ? 'Paste the raw API key to enable:' : 'Paste the raw API key to disable:');
+  if (!rawKey) return;
+  try {
+    await api('/providers/' + encodeURIComponent(providerId) + '/keys/' + (enable?'enable':'disable'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ key: rawKey })
+    });
+    toast('Key ' + (enable?'enabled':'disabled'), 'success');
+    loadKeyHealth();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// Routing Tab (Sprint 9)
+// ============================================================
+async function loadRouting() {
+  try {
+    var d = await api('/routing');
+    var rs = document.getElementById('routingStrategySelect');
+    var ks = document.getElementById('keyStrategySelect');
+    rs.innerHTML = (d.availableStrategies || []).map(function(s) {
+      return '<option value="'+esc(s)+'"' + (s === d.strategy ? ' selected' : '') + '>'+esc(s)+'</option>';
+    }).join('');
+    ks.innerHTML = (d.availableKeySelectionStrategies || []).map(function(s) {
+      return '<option value="'+esc(s)+'"' + (s === d.keySelectionStrategy ? ' selected' : '') + '>'+esc(s)+'</option>';
+    }).join('');
+    document.getElementById('providerStrategyBody').innerHTML = (d.providers || []).map(function(p) {
+      return '<tr><td class="mono">'+esc(p.id)+'</td><td><span class="badge blue">'+esc(p.keySelectionStrategy)+'</span></td></tr>';
+    }).join('') || '<tr><td colspan="2" class="muted" style="text-align:center;padding:24px">No providers</td></tr>';
+  } catch(e) {
+    toast('Failed to load routing config: ' + e.message, 'error');
+  }
+}
+
+async function saveRouting() {
+  var strategy = document.getElementById('routingStrategySelect').value;
+  var keySelectionStrategy = document.getElementById('keyStrategySelect').value;
+  try {
+    await api('/routing', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ strategy: strategy, keySelectionStrategy: keySelectionStrategy })
+    });
+    toast('Routing strategy applied', 'success');
+    loadRouting();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'error');
   }
 }
 

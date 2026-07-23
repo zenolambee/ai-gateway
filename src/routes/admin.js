@@ -8,11 +8,19 @@ const {
   healthMonitor,
   providerManager,
   apiKeyStore,
+  apiKeyManager,
   usageTracker,
   modelRegistry,
   requestLog,
   providerConfigManager,
   rateLimiter,
+  modelRouter,
+  routingStrategy,
+  keySelectionStrategy,
+  routingConfig,
+  aliasResolver,
+  ruleEngine,
+  discovery,
 } = require('../services');
 
 /**
@@ -266,18 +274,16 @@ router.get('/keys/:id/usage', (req, res, next) => {
   }
 });
 
-// --- Model Registry ---
-router.get('/models', async (req, res) => {
-  const entries = await modelRegistry.getEntries();
-  const health = healthMonitor.getAllHealth();
-  res.json({
-    models: entries.map((e) => ({
-      id: e.id,
-      providers: e.providers,
-      capabilities: e.capabilities,
-      health: e.providers.map((pid) => health[pid]).filter(Boolean),
-    })),
-  });
+// --- Model Registry (rich — Sprint 10) ---
+// The /admin/api/models endpoint now returns the full rich model records
+// (aliases, capabilities, health, latency, success rate, priority,
+// context length, endpoint). The simpler shape is still available via
+// GET /v1/models (public, OpenAI-compatible).
+router.get('/models', async (req, res, next) => {
+  try {
+    const entries = await modelRegistry.getRichEntries();
+    res.json({ models: entries });
+  } catch (err) { next(err); }
 });
 
 // --- Monitoring ---
@@ -392,6 +398,346 @@ router.put('/config', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// ---------------------------------------------------------------
+// Routing Strategy (Sprint 9)
+// ---------------------------------------------------------------
+
+/**
+ * GET /admin/api/routing
+ *
+ * Returns the current routing strategy, the list of available strategies,
+ * the per-provider key selection strategies, and the key selection strategy
+ * options.
+ */
+router.get('/routing', (req, res) => {
+  res.json({
+    strategy: modelRouter.getStrategy(),
+    keySelectionStrategy: routingConfig.keySelectionStrategy || 'round-robin',
+    availableStrategies: routingStrategy.listStrategies(),
+    availableKeySelectionStrategies: keySelectionStrategy.listStrategies(),
+    providers: providerManager.listProviders().map((p) => ({
+      id: p.id,
+      keySelectionStrategy: apiKeyManager.getStrategy(p.id),
+    })),
+  });
+});
+
+/**
+ * PUT /admin/api/routing
+ *
+ * Update the routing strategy at runtime (no restart). The body should
+ * contain { strategy: string } and/or { keySelectionStrategy: string }.
+ * The routing strategy applies globally; the key selection strategy
+ * applies per-provider via the provider config or can be set globally
+ * here as the default for all providers.
+ *
+ * This does NOT write to config/routing.json — changes are in-memory and
+ * revert on restart. To persist, edit config/routing.json (hot-reloaded).
+ */
+router.put('/routing', (req, res, next) => {
+  try {
+    if (req.body.strategy !== undefined) {
+      const id = req.body.strategy;
+      const available = routingStrategy.listStrategies();
+      if (!available.includes(id)) {
+        throw new AppError(`Unknown routing strategy "${id}". Available: ${available.join(', ')}`, 400, {
+          code: 'INVALID_REQUEST', available,
+        });
+      }
+      modelRouter.setStrategy(id);
+    }
+    if (req.body.keySelectionStrategy !== undefined) {
+      const id = req.body.keySelectionStrategy;
+      const available = keySelectionStrategy.listStrategies();
+      if (!available.includes(id)) {
+        throw new AppError(`Unknown key selection strategy "${id}". Available: ${available.join(', ')}`, 400, {
+          code: 'INVALID_REQUEST', available,
+        });
+      }
+      // Set as default for providers that don't override it.
+      apiKeyManager.defaultStrategy = id;
+      // Also apply to all providers currently using the previous default.
+      for (const p of providerManager.listProviders()) {
+        // Only override if the provider didn't have an explicit strategy
+        // in its config (detected by matching the previous default).
+        // We can't know the original config value here, so we set it
+        // unconditionally — the admin API is an explicit override.
+        apiKeyManager.setStrategy(p.id, id);
+      }
+    }
+    if (req.body.providerKeySelectionStrategy !== undefined) {
+      // Per-provider override: { providerId: strategyId, ... }
+      const overrides = req.body.providerKeySelectionStrategy;
+      if (overrides && typeof overrides === 'object' && !Array.isArray(overrides)) {
+        for (const [providerId, stratId] of Object.entries(overrides)) {
+          apiKeyManager.setStrategy(providerId, stratId);
+        }
+      }
+    }
+    res.json({
+      success: true,
+      strategy: modelRouter.getStrategy(),
+      keySelectionStrategy: apiKeyManager.defaultStrategy,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Provider Key Health (Sprint 9)
+// ---------------------------------------------------------------
+
+/**
+ * GET /admin/api/providers/:id/keys
+ *
+ * Returns per-key health for a provider: status, priority, weight,
+ * success rate, error rate, average latency, request count, token usage,
+ * last success/failure, cooldown status.
+ */
+router.get('/providers/:id/keys', (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const provider = providerManager.providersById.get(id);
+    if (!provider) {
+      throw new AppError(`Provider "${id}" not found`, 404, { code: 'PROVIDER_NOT_FOUND' });
+    }
+    const keys = apiKeyManager.getKeyHealth(id);
+    res.json({ providerId: id, keys });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /admin/api/providers/:id/keys/:key/disable
+ * POST /admin/api/providers/:id/keys/:key/enable
+ *
+ * Manually disable/enable a specific provider API key. The :key param is
+ * the masked key value from the keys list — but for safety we accept the
+ * raw key value. (Admin-only, so this is acceptable.)
+ */
+router.post('/providers/:id/keys/:action(enable|disable)', (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const action = req.params.action;
+    const key = req.body && req.body.key;
+    if (!key) {
+      throw new AppError('"key" is required in the body', 400, { code: 'INVALID_REQUEST' });
+    }
+    const ok = action === 'disable'
+      ? apiKeyManager.disableKey(id, key)
+      : apiKeyManager.enableKey(id, key);
+    if (!ok) {
+      throw new AppError(`Key not found for provider "${id}"`, 404, { code: 'PROVIDER_NOT_FOUND' });
+    }
+    res.json({ success: true, providerId: id, action });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Model Registry — Rich Model Records (Sprint 10)
+// (The GET /admin/api/models endpoint is defined above with getRichEntries.)
+// ---------------------------------------------------------------
+
+// ---------------------------------------------------------------
+// Aliases (Sprint 10)
+// ---------------------------------------------------------------
+
+/**
+ * GET /admin/api/aliases
+ *
+ * Returns all configured model aliases and the canonical model ids they
+ * map to.
+ */
+router.get('/aliases', (req, res) => {
+  res.json({ aliases: aliasResolver.listAliases() });
+});
+
+/**
+ * PUT /admin/api/aliases
+ *
+ * Add or update an alias at runtime. Body: { alias: string, models: string[] }
+ * Does NOT persist to disk — use config/aliases.json for persistence (hot-reloaded).
+ */
+router.put('/aliases', (req, res, next) => {
+  try {
+    const { alias, models } = req.body;
+    if (!alias || typeof alias !== 'string') {
+      throw new AppError('"alias" is required', 400, { code: 'INVALID_REQUEST' });
+    }
+    if (!Array.isArray(models) || models.length === 0) {
+      throw new AppError('"models" must be a non-empty array', 400, { code: 'INVALID_REQUEST' });
+    }
+    aliasResolver.setAlias(alias, models);
+    modelRegistry.invalidate();
+    res.json({ success: true, alias, models });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /admin/api/aliases/:alias
+ *
+ * Remove an alias at runtime.
+ */
+router.delete('/aliases/:alias', (req, res, next) => {
+  try {
+    const removed = aliasResolver.removeAlias(req.params.alias);
+    if (!removed) {
+      throw new AppError(`Alias "${req.params.alias}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    modelRegistry.invalidate();
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Routing Rules (Sprint 10)
+// ---------------------------------------------------------------
+
+/**
+ * GET /admin/api/routing-rules
+ *
+ * Returns all configured routing rules.
+ */
+router.get('/routing-rules', (req, res) => {
+  res.json({ rules: ruleEngine.listRules() });
+});
+
+/**
+ * PUT /admin/api/routing-rules
+ *
+ * Add or update a routing rule. Body: { id, description?, when, then }
+ */
+router.put('/routing-rules', (req, res, next) => {
+  try {
+    const ok = ruleEngine.setRule(req.body);
+    if (!ok) {
+      throw new AppError('Invalid rule (requires id, when, then)', 400, { code: 'INVALID_REQUEST' });
+    }
+    res.json({ success: true, rule: req.body });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /admin/api/routing-rules/:id
+ *
+ * Remove a routing rule.
+ */
+router.delete('/routing-rules/:id', (req, res, next) => {
+  try {
+    const removed = ruleEngine.removeRule(req.params.id);
+    if (!removed) {
+      throw new AppError(`Rule "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Per-Model Provider Order (Sprint 10)
+// ---------------------------------------------------------------
+
+/**
+ * GET /admin/api/model-routing
+ *
+ * Returns the per-model routing overrides (provider order + strategy).
+ */
+router.get('/model-routing', (req, res) => {
+  res.json({ overrides: modelRouter.getModelOverrides() });
+});
+
+/**
+ * PUT /admin/api/model-routing
+ *
+ * Set per-model routing overrides. Body: { overrides: { [model]: { strategy?, providerOrder? } } }
+ * Example: { overrides: { "gpt-5": { providerOrder: ["openai", "openrouter", "providerX"] } } }
+ */
+router.put('/model-routing', (req, res, next) => {
+  try {
+    const { overrides } = req.body;
+    if (!overrides || typeof overrides !== 'object') {
+      throw new AppError('"overrides" object is required', 400, { code: 'INVALID_REQUEST' });
+    }
+    modelRouter.setModelOverrides(overrides);
+    res.json({ success: true, overrides: modelRouter.getModelOverrides() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Provider Discovery (Sprint 10)
+// ---------------------------------------------------------------
+
+/**
+ * POST /admin/api/discover
+ *
+ * Trigger provider discovery: query each enabled provider's /models and
+ * merge the discovered models into the registry. Returns the discovery
+ * status per provider.
+ */
+router.post('/discover', async (req, res, next) => {
+  try {
+    const result = await discovery.discover();
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /admin/api/refresh-models
+ *
+ * Invalidate the model registry cache so the next request triggers a
+ * fresh aggregation. Equivalent to a manual refresh of the model list.
+ */
+router.post('/refresh-models', (req, res, next) => {
+  try {
+    modelRegistry.invalidate();
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /admin/api/refresh-capabilities
+ *
+ * Re-detect capabilities for all models and refresh the registry. This
+ * runs discovery + cache invalidation so capabilities are re-read from
+ * the adapters.
+ */
+router.post('/refresh-capabilities', async (req, res, next) => {
+  try {
+    await discovery.discover();
+    modelRegistry.invalidate();
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /admin/api/discovery-status
+ *
+ * Returns the last discovery result (which providers were queried, how
+ * many models were found, errors).
+ */
+router.get('/discovery-status', (req, res) => {
+  res.json({ status: discovery.getStatus() });
 });
 
 module.exports = router;

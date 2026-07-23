@@ -1,0 +1,7 @@
+{
+  "aliases": {
+    "gpt-5": { "models": ["gpt-5", "gpt-4o", "gpt-4o-mini"] },
+    "claude-sonnet": { "models": ["claude-3-5-sonnet", "claude-3-sonnet"] },
+    "kimi-k3": { "models": ["moonshot-v1-128k"] }
+  }
+}

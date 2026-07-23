@@ -342,14 +342,17 @@ class HttpClient {
         throw normalized;
       }
 
-      if (this.apiKeyManager && apiKey) {
-        this.apiKeyManager.reportSuccess(provider.id, apiKey);
-      }
+      // Per-key health reporting is done by the RequestExecutor, which has
+      // access to per-attempt latency and token counts. The HttpClient
+      // reports failures (below) so cooldown logic triggers immediately on
+      // a bad response, but success reporting is deferred to the executor
+      // to avoid double-counting.
 
       return {
         status: res.status,
         headers: res.headers,
         data: res.data,
+        _resolvedApiKey: apiKey,
       };
     } catch (err) {
       logCtx.durationMs = Date.now() - startedAt;

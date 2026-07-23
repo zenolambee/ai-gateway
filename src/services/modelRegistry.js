@@ -34,14 +34,20 @@ class ModelRegistry {
    * @param {object} deps
    * @param {object} deps.providerManager - ProviderManager instance
    * @param {object} deps.adapterRegistry - ProviderAdapterRegistry instance
+   * @param {object} [deps.aliasResolver] - ModelAliasResolver instance
+   * @param {object} [deps.healthMonitor] - ProviderHealthMonitor for health/latency enrichment
+   * @param {object} [deps.discovery] - ProviderDiscovery for capability detection
    * @param {object} [opts]
    * @param {number} [opts.cacheTtlMs=60000] - cache time-to-live in ms
    */
-  constructor({ providerManager, adapterRegistry }, opts = {}) {
+  constructor({ providerManager, adapterRegistry, aliasResolver, healthMonitor, discovery }, opts = {}) {
     if (!providerManager) throw new Error('ModelRegistry requires a providerManager');
     if (!adapterRegistry) throw new Error('ModelRegistry requires an adapterRegistry');
     this.providerManager = providerManager;
     this.adapterRegistry = adapterRegistry;
+    this.aliasResolver = aliasResolver || null;
+    this.healthMonitor = healthMonitor || null;
+    this.discovery = discovery || null;
     this.cacheTtlMs = typeof opts.cacheTtlMs === 'number' ? opts.cacheTtlMs : DEFAULT_CACHE_TTL_MS;
 
     // cache state
@@ -74,6 +80,7 @@ class ModelRegistry {
   async _doRefresh() {
     const providers = this.providerManager.getEnabledProviders();
     const byId = new Map(); // modelId -> internalEntry
+    const health = this.healthMonitor ? this.healthMonitor.getAllHealth() : {};
 
     for (const provider of providers) {
       try {
@@ -94,13 +101,33 @@ class ModelRegistry {
           ? adapter.capabilityInfo()
           : this._capsFromAdapter(adapter);
 
+        // Per-provider context length (optional; from config or adapter)
+        const contextLength = provider.contextLength || (adapter.contextLength ? adapter.contextLength(provider) : undefined);
+
+        // Per-provider endpoint (chat completions path)
+        let endpoint;
+        try { endpoint = adapter.chatEndpoint(provider); } catch { endpoint = '/chat/completions'; }
+
+        const providerHealth = health[provider.id] || null;
+
         for (const modelId of models) {
           if (byId.has(modelId)) {
             // Deduplicate: merge provider ids + capabilities (union).
             const existing = byId.get(modelId);
             existing.providers.push(provider.id);
-            existing._providers.push({ id: provider.id, name: provider.name, priority: provider.priority });
+            existing._providers.push({
+              id: provider.id, name: provider.name, priority: provider.priority,
+              weight: provider.weight || 1,
+              endpoint,
+              contextLength,
+              health: providerHealth,
+              latency: providerHealth ? providerHealth.averageLatencyMs : 0,
+              successRate: providerHealth ? providerHealth.successRate : 100,
+            });
             this._mergeCaps(existing.capabilities, caps);
+            // Merge per-provider priority/latency for the aggregated entry.
+            existing.latency = Math.min(existing.latency || Infinity, providerHealth ? providerHealth.averageLatencyMs : 0);
+            existing.successRate = Math.min(existing.successRate || 100, providerHealth ? providerHealth.successRate : 100);
           } else {
             byId.set(modelId, {
               id: modelId,
@@ -109,8 +136,22 @@ class ModelRegistry {
               owned_by: provider.id,
               // Internal metadata (not exposed in the OpenAI response):
               providers: [provider.id],
-              _providers: [{ id: provider.id, name: provider.name, priority: provider.priority }],
+              _providers: [{
+                id: provider.id, name: provider.name, priority: provider.priority,
+                weight: provider.weight || 1,
+                endpoint,
+                contextLength,
+                health: providerHealth,
+                latency: providerHealth ? providerHealth.averageLatencyMs : 0,
+                successRate: providerHealth ? providerHealth.successRate : 100,
+              }],
               capabilities: { ...caps },
+              // Aggregated health (best across providers)
+              latency: providerHealth ? providerHealth.averageLatencyMs : 0,
+              successRate: providerHealth ? providerHealth.successRate : 100,
+              priority: provider.priority,
+              // Aliases that resolve to this model (filled below)
+              aliases: [],
             });
           }
         }
@@ -120,6 +161,13 @@ class ModelRegistry {
           providerId: provider && provider.id,
           error: e && e.message,
         });
+      }
+    }
+
+    // Enrich entries with aliases (reverse lookup from the alias resolver).
+    if (this.aliasResolver) {
+      for (const entry of byId.values()) {
+        entry.aliases = this.aliasResolver.aliasesForModel(entry.id);
       }
     }
 
@@ -258,6 +306,68 @@ class ModelRegistry {
     for (const key of Object.keys(source)) {
       if (source[key]) target[key] = true;
     }
+  }
+
+  // ---------------------------------------------------------------
+  // Rich / admin-facing API (Sprint 10)
+  // ---------------------------------------------------------------
+
+  /**
+   * Return the aggregated list of rich model entries (for the admin
+   * dashboard). Each entry includes the full internal metadata:
+   * providers, capabilities, aliases, health, latency, success rate,
+   * priority, context length, endpoint.
+   *
+   * @returns {Promise<Array<object>>}
+   */
+  async getRichEntries() {
+    const entries = await this.getEntries();
+    return entries.map((e) => this._toRichModel(e));
+  }
+
+  /**
+   * Return a single rich model entry by id (for the admin dashboard).
+   * Returns null when the model is not found.
+   *
+   * @param {string} modelId
+   * @returns {Promise<object|null>}
+   */
+  async getRichEntry(modelId) {
+    const entry = await this.getEntry(modelId);
+    if (!entry) return null;
+    return this._toRichModel(entry);
+  }
+
+  /**
+   * Project an internal entry to the rich model shape for the admin API.
+   * @param {object} entry
+   * @returns {object}
+   * @private
+   */
+  _toRichModel(entry) {
+    return {
+      id: entry.id,
+      object: 'model',
+      created: entry.created,
+      owned_by: entry.owned_by,
+      aliases: entry.aliases || [],
+      providers: (entry._providers || []).map((p) => ({
+        id: p.id,
+        name: p.name,
+        priority: p.priority,
+        weight: p.weight || 1,
+        endpoint: p.endpoint,
+        contextLength: p.contextLength,
+        latency: p.latency || 0,
+        successRate: p.successRate || 100,
+        health: p.health || null,
+      })),
+      capabilities: { ...(entry.capabilities || {}) },
+      // Aggregated health across providers
+      latency: entry.latency || 0,
+      successRate: entry.successRate || 100,
+      priority: entry.priority,
+    };
   }
 }
 

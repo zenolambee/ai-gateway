@@ -31,6 +31,8 @@ class ProviderConfigManager {
    * @param {object} [deps.modelRegistry] - for cache invalidation
    * @param {object} [deps.healthMonitor] - for health state reset
    * @param {object} [deps.metricsCollector] - for reload metrics
+   * @param {object} [deps.modelRouter] - for routing strategy re-application
+   * @param {object} [deps.routingConfig] - current routing config
    * @param {object} [opts]
    * @param {number} [opts.debounceMs=100] - debounce for file-watch events
    * @param {boolean} [opts.watch=true] - whether to start watching
@@ -42,6 +44,11 @@ class ProviderConfigManager {
     modelRegistry,
     healthMonitor,
     metricsCollector,
+    modelRouter,
+    routingConfig,
+    aliasResolver,
+    ruleEngine,
+    discovery,
   } = {}, opts = {}) {
     this.providerManager = providerManager;
     this.adapterRegistry = adapterRegistry || null;
@@ -49,6 +56,11 @@ class ProviderConfigManager {
     this.modelRegistry = modelRegistry || null;
     this.healthMonitor = healthMonitor || null;
     this.metricsCollector = metricsCollector || null;
+    this.modelRouter = modelRouter || null;
+    this.routingConfig = routingConfig || null;
+    this.aliasResolver = aliasResolver || null;
+    this.ruleEngine = ruleEngine || null;
+    this.discovery = discovery || null;
 
     this.debounceMs = opts.debounceMs !== undefined ? opts.debounceMs : 100;
     this._watcher = null;
@@ -160,8 +172,9 @@ class ProviderConfigManager {
 
   /**
    * Run the reload cascade: reset the adapter cache, reload API keys,
-   * invalidate the model registry cache, and reset the health monitor.
-   * Each step is independent — a failure in one does not block the others.
+   * invalidate the model registry cache, reset the health monitor, and
+   * re-apply the routing strategy. Each step is independent — a failure
+   * in one does not block the others.
    *
    * @param {Array<object>} providers - the new normalized provider list
    * @private
@@ -188,6 +201,40 @@ class ProviderConfigManager {
     if (this.healthMonitor && typeof this.healthMonitor.reset === 'function') {
       try { this.healthMonitor.reset(); } catch (e) {
         logger.warn('ProviderConfigManager: healthMonitor.reset failed', { error: e && e.message });
+      }
+    }
+
+    // Re-apply the routing strategy from the current config so a hot reload
+    // of config/routing.json takes effect without a restart. The modelRouter
+    // keeps its own strategy state; we refresh it here.
+    if (this.modelRouter && this.routingConfig) {
+      try {
+        const strategy = this.routingConfig.strategy || 'priority';
+        this.modelRouter.setStrategy(strategy);
+      } catch (e) {
+        logger.warn('ProviderConfigManager: modelRouter.setStrategy failed', { error: e && e.message });
+      }
+    }
+
+    // Re-load aliases from disk so config/aliases.json changes take effect
+    // without a restart.
+    if (this.aliasResolver) {
+      try {
+        const { loadAliasesConfig } = require('../config/aliasesConfig');
+        this.aliasResolver.load(loadAliasesConfig());
+      } catch (e) {
+        logger.warn('ProviderConfigManager: aliasResolver.load failed', { error: e && e.message });
+      }
+    }
+
+    // Re-load routing rules from disk so config/routingRules.json changes
+    // take effect without a restart.
+    if (this.ruleEngine) {
+      try {
+        const { loadRoutingRulesConfig } = require('../config/routingRulesConfig');
+        this.ruleEngine.load(loadRoutingRulesConfig().rules);
+      } catch (e) {
+        logger.warn('ProviderConfigManager: ruleEngine.load failed', { error: e && e.message });
       }
     }
   }

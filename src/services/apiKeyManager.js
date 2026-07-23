@@ -1,4 +1,5 @@
 const logger = require('../utils/logger');
+const { getStrategy: getKeySelectionStrategy } = require('./keySelectionStrategy');
 
 /**
  * API key status codes.
@@ -78,13 +79,17 @@ function maskKey(key) {
  *
  * @param {string} providerId
  * @param {string} value - the actual API key string
+ * @param {object} [meta] - optional key metadata: { priority, weight }
  * @returns {object}
  */
-function createKeyRecord(providerId, value) {
+function createKeyRecord(providerId, value, meta = {}) {
   return {
     providerId,
     value,
     status: KeyStatus.ACTIVE,
+    // optional per-key metadata (used by priority / weighted strategies)
+    priority: typeof meta.priority === 'number' ? meta.priority : 0,
+    weight: typeof meta.weight === 'number' && meta.weight > 0 ? meta.weight : 1,
     // statistics
     stats: {
       totalRequests: 0,
@@ -93,6 +98,13 @@ function createKeyRecord(providerId, value) {
       consecutiveFailures: 0,
       lastUsed: null,
       lastError: null,
+      // health metrics (Sprint 9 additions)
+      totalTokens: 0,
+      latencySum: 0,
+      latencyCount: 0,
+      averageLatencyMs: 0,
+      lastSuccess: null,
+      lastFailure: null,
     },
     cooldownUntil: null,
   };
@@ -122,16 +134,20 @@ class ApiKeyManager {
    * @param {object} [opts]
    * @param {object} [opts.cooldownsMs] - override default cooldown durations
    * @param {number} [opts.failureThreshold] - consecutive failures before cooldown
+   * @param {string} [opts.defaultStrategy] - default key selection strategy id
    */
   constructor(opts = {}) {
     // providerId -> array of key records
     this.keysByProvider = new Map();
-    // providerId -> round-robin cursor
+    // providerId -> round-robin / strategy cursor
     this.cursorsByProvider = new Map();
+    // providerId -> per-provider config (strategy, cooldowns, threshold)
+    this.providerConfig = new Map();
     this.cooldownsMs = { ...DEFAULT_COOLDOWNS_MS, ...(opts.cooldownsMs || {}) };
     this.failureThreshold = opts.failureThreshold !== undefined
       ? opts.failureThreshold
       : DEFAULT_FAILURE_THRESHOLD;
+    this.defaultStrategy = opts.defaultStrategy || 'round-robin';
     this.loaded = false;
   }
 
@@ -139,9 +155,15 @@ class ApiKeyManager {
    * Load keys from an array of provider config objects.
    *
    * Each provider must have an `id` and (optionally) an `apiKeys` array of
-   * strings. Calling this method resets any previously loaded keys for the
-   * given providers. Keys that were not present in the new config are
-   * dropped; previously known keys keep their stats if they still exist.
+   * strings OR objects ({ value, priority, weight }). Calling this method
+   * resets any previously loaded keys for the given providers. Keys that
+   * were not present in the new config are dropped; previously known keys
+   * keep their stats if they still exist.
+   *
+   * Per-provider configuration is extracted from:
+   *   - provider.keySelectionStrategy  : strategy id (default: round-robin)
+   *   - provider.cooldownPolicy        : { RATE_LIMITED, SERVER_ERROR, ... }
+   *   - provider.cooldownFailureThreshold : consecutive failures before cooldown
    *
    * @param {Array<object>} providers - normalized provider configs
    * @returns {ApiKeyManager} this (for chaining)
@@ -153,18 +175,52 @@ class ApiKeyManager {
     }
 
     const next = new Map();
+    const nextConfig = new Map();
     for (const p of providers) {
       if (!p || !p.id) continue;
-      const keys = Array.isArray(p.apiKeys) ? p.apiKeys.filter((k) => k && typeof k === 'string') : [];
-      const records = keys.map((value) => {
+
+      // Extract per-provider key selection strategy + cooldown overrides.
+      const strategyId = (p.keySelectionStrategy && typeof p.keySelectionStrategy === 'string')
+        ? p.keySelectionStrategy
+        : this.defaultStrategy;
+      const cooldownOverride = (p.cooldownPolicy && typeof p.cooldownPolicy === 'object')
+        ? { ...this.cooldownsMs, ...p.cooldownPolicy }
+        : null;
+      const threshold = (typeof p.cooldownFailureThreshold === 'number')
+        ? p.cooldownFailureThreshold
+        : this.failureThreshold;
+      nextConfig.set(p.id, { strategy: strategyId, cooldownsMs: cooldownOverride, failureThreshold: threshold });
+
+      // Normalize keys: accept strings or { value, priority, weight } objects.
+      const rawKeys = Array.isArray(p.apiKeys) ? p.apiKeys : [];
+      const records = [];
+      for (const entry of rawKeys) {
+        if (!entry) continue;
+        let value, meta;
+        if (typeof entry === 'string') {
+          value = entry;
+          meta = {};
+        } else if (entry && typeof entry === 'object' && typeof entry.value === 'string') {
+          value = entry.value;
+          meta = { priority: entry.priority, weight: entry.weight };
+        } else {
+          continue;
+        }
         const existing = this._findKeyRecord(p.id, value);
-        if (existing) return existing; // preserve stats/cooldown across reloads
-        return createKeyRecord(p.id, value);
-      });
+        if (existing) {
+          // preserve stats/cooldown across reloads; refresh metadata
+          if (meta.priority !== undefined) existing.priority = meta.priority;
+          if (meta.weight !== undefined) existing.weight = meta.weight;
+          records.push(existing);
+        } else {
+          records.push(createKeyRecord(p.id, value, meta));
+        }
+      }
       next.set(p.id, records);
     }
 
     this.keysByProvider = next;
+    this.providerConfig = nextConfig;
     this.cursorsByProvider = new Map();
     this.loaded = true;
 
@@ -174,6 +230,53 @@ class ApiKeyManager {
     });
 
     return this;
+  }
+
+  /**
+   * Get the configured key selection strategy id for a provider.
+   * @param {string} providerId
+   * @returns {string}
+   */
+  getStrategy(providerId) {
+    const cfg = this.providerConfig.get(providerId);
+    return (cfg && cfg.strategy) || this.defaultStrategy;
+  }
+
+  /**
+   * Set the key selection strategy for a provider at runtime (admin API).
+   * @param {string} providerId
+   * @param {string} strategyId
+   */
+  setStrategy(providerId, strategyId) {
+    const cfg = this.providerConfig.get(providerId) || {
+      strategy: this.defaultStrategy,
+      cooldownsMs: null,
+      failureThreshold: this.failureThreshold,
+    };
+    cfg.strategy = strategyId || this.defaultStrategy;
+    this.providerConfig.set(providerId, cfg);
+  }
+
+  /**
+   * Get the cooldown configuration for a provider (merge of defaults +
+   * per-provider overrides). Returns the default cooldowns when the
+   * provider has no override.
+   * @param {string} providerId
+   * @returns {object}
+   */
+  _cooldownsFor(providerId) {
+    const cfg = this.providerConfig.get(providerId);
+    return (cfg && cfg.cooldownsMs) || this.cooldownsMs;
+  }
+
+  /**
+   * Get the failure threshold for a provider (per-provider override or default).
+   * @param {string} providerId
+   * @returns {number}
+   */
+  _thresholdFor(providerId) {
+    const cfg = this.providerConfig.get(providerId);
+    return (cfg && typeof cfg.failureThreshold === 'number') ? cfg.failureThreshold : this.failureThreshold;
   }
 
   /**
@@ -217,11 +320,11 @@ class ApiKeyManager {
   }
 
   /**
-   * Select the next ACTIVE key for a provider using round-robin.
+   * Select the next ACTIVE key for a provider using the configured strategy.
    *
    * Side effects:
    *   - expired cooldowns are cleared (auto re-enable)
-   *   - the round-robin cursor is advanced
+   *   - the strategy cursor is advanced (for round-robin)
    *   - the returned key's `stats.lastUsed` is updated
    *
    * Throws an AppError (503) when no ACTIVE key is available.
@@ -239,28 +342,51 @@ class ApiKeyManager {
       throw err;
     }
 
+    // Reconcile cooldowns so cooled-down keys that have expired become
+    // ACTIVE again before the strategy runs.
     for (const r of records) this._reconcileCooldown(r);
 
-    const n = records.length;
-    const cursor = this.cursorsByProvider.get(providerId) || 0;
-    let selected = null;
+    // Filter to ACTIVE candidates (RATE_LIMITED keys are also skipped; they
+    // are reactivated by reportSuccess or by an explicit enable call, since
+    // the provider usually sends a Retry-After that we honour via cooldown).
+    const candidates = records.filter((r) => r.status === KeyStatus.ACTIVE);
 
-    for (let i = 0; i < n; i += 1) {
-      const idx = (cursor + i) % n;
-      const record = records[idx];
-      if (record.status === KeyStatus.ACTIVE) {
-        selected = record;
-        this.cursorsByProvider.set(providerId, (idx + 1) % n);
-        break;
-      }
-    }
-
-    if (!selected) {
+    if (candidates.length === 0) {
       const err = new Error(`All API keys for provider "${providerId}" are unavailable`);
       err.statusCode = 503;
       err.info = { code: 'ALL_KEYS_UNAVAILABLE', providerId };
       throw err;
     }
+
+    // Resolve the configured strategy for this provider and apply it.
+    const strategyId = this.getStrategy(providerId);
+    const cursor = this.cursorsByProvider.get(providerId) || { lastIdx: -1, lastValue: null };
+    let strategyFn;
+    try {
+      strategyFn = getKeySelectionStrategy(strategyId);
+    } catch (err) {
+      logger.warn('Unknown key selection strategy, falling back to round-robin', {
+        providerId, strategy: strategyId, error: err.message,
+      });
+      strategyFn = getKeySelectionStrategy('round-robin');
+    }
+
+    let idx = -1;
+    try {
+      idx = strategyFn(candidates, cursor);
+    } catch (err) {
+      logger.warn('Key selection strategy failed, falling back to first candidate', {
+        providerId, strategy: strategyId, error: err.message,
+      });
+      idx = 0;
+    }
+    if (idx < 0 || idx >= candidates.length) idx = 0;
+
+    const selected = candidates[idx];
+    // Update the cursor for the next call (round-robin uses lastValue).
+    cursor.lastIdx = idx;
+    cursor.lastValue = selected.value;
+    this.cursorsByProvider.set(providerId, cursor);
 
     selected.stats.lastUsed = new Date().toISOString();
     selected.stats.totalRequests += 1;
@@ -270,17 +396,33 @@ class ApiKeyManager {
   /**
    * Report that a request using a key succeeded. Resets transient failure
    * state — if the key was in COOLDOWN due to a transient error it is moved
-   * back to ACTIVE.
+   * back to ACTIVE. Records latency and token usage for health-aware
+   * strategies (least-used, fastest-response).
    *
    * @param {string} providerId
    * @param {string} key
+   * @param {object} [detail] - { latencyMs, tokens }
    */
-  reportSuccess(providerId, key) {
+  reportSuccess(providerId, key, detail = {}) {
     const record = this._findKeyRecord(providerId, key);
     if (!record) return;
     record.stats.successCount += 1;
     record.stats.consecutiveFailures = 0;
+    record.stats.lastSuccess = Date.now();
+    if (typeof detail.latencyMs === 'number' && detail.latencyMs > 0) {
+      record.stats.latencySum += detail.latencyMs;
+      record.stats.latencyCount += 1;
+      record.stats.averageLatencyMs = Math.round(record.stats.latencySum / record.stats.latencyCount);
+    }
+    if (typeof detail.tokens === 'number' && detail.tokens > 0) {
+      record.stats.totalTokens += detail.tokens;
+    }
     if (record.status === KeyStatus.COOLDOWN) {
+      record.status = KeyStatus.ACTIVE;
+      record.cooldownUntil = null;
+    }
+    // A successful request after a rate-limit also reactivates the key.
+    if (record.status === KeyStatus.RATE_LIMITED) {
       record.status = KeyStatus.ACTIVE;
       record.cooldownUntil = null;
     }
@@ -306,6 +448,7 @@ class ApiKeyManager {
 
     record.stats.failureCount += 1;
     record.stats.consecutiveFailures += 1;
+    record.stats.lastFailure = Date.now();
     record.stats.lastError = {
       message: (error && error.message) || 'unknown error',
       code: (error && error.info && error.info.code) || null,
@@ -341,14 +484,17 @@ class ApiKeyManager {
 
     // Cooldown for transient failures — only after reaching the threshold of
     // consecutive failures, so a single blip inside a retry loop does not
-    // immediately make the key unavailable.
+    // immediately make the key unavailable. Use the per-provider cooldown
+    // durations and threshold when configured, else the global defaults.
+    const providerCooldowns = this._cooldownsFor(providerId);
     const cooldownMs = opts.cooldownMs !== undefined
       ? opts.cooldownMs
-      : this.cooldownsMs[category] !== undefined
-        ? this.cooldownsMs[category]
-        : this.cooldownsMs.UNKNOWN;
+      : providerCooldowns[category] !== undefined
+        ? providerCooldowns[category]
+        : providerCooldowns.UNKNOWN;
 
-    if (cooldownMs > 0 && record.stats.consecutiveFailures >= this.failureThreshold) {
+    const threshold = this._thresholdFor(providerId);
+    if (cooldownMs > 0 && record.stats.consecutiveFailures >= threshold) {
       record.status = KeyStatus.COOLDOWN;
       record.cooldownUntil = Date.now() + cooldownMs;
       logger.warn('API key placed in cooldown', {
@@ -418,15 +564,48 @@ class ApiKeyManager {
    * @private
    */
   _snapshot(record) {
+    const s = record.stats;
+    const total = s.successCount + s.failureCount;
     return {
       providerId: record.providerId,
       key: maskKey(record.value),
       status: record.status,
-      stats: { ...record.stats },
+      priority: record.priority,
+      weight: record.weight,
+      stats: {
+        ...s,
+        successRate: total > 0 ? Math.round((s.successCount / total) * 10000) / 100 : 100,
+        errorRate: total > 0 ? Math.round((s.failureCount / total) * 10000) / 100 : 0,
+      },
       cooldownUntil: record.cooldownUntil !== null
         ? new Date(record.cooldownUntil).toISOString()
         : null,
+      lastSuccess: s.lastSuccess ? new Date(s.lastSuccess).toISOString() : null,
+      lastFailure: s.lastFailure ? new Date(s.lastFailure).toISOString() : null,
     };
+  }
+
+  /**
+   * Return a per-key health snapshot for a provider. Includes latency,
+   * success rate, error rate, cooldown status, request count, and token
+   * usage — for the admin dashboard.
+   * @param {string} providerId
+   * @returns {Array<object>}
+   */
+  getKeyHealth(providerId) {
+    return this._records(providerId).map((r) => this._snapshot(r));
+  }
+
+  /**
+   * Return per-key health for every provider (admin API).
+   * @returns {object} { [providerId]: Array<snapshot> }
+   */
+  getAllKeyHealth() {
+    const out = {};
+    for (const [providerId, records] of this.keysByProvider) {
+      out[providerId] = records.map((r) => this._snapshot(r));
+    }
+    return out;
   }
 }
 

@@ -226,8 +226,21 @@ function validateProvider(provider) {
   if (provider.apiKeys !== undefined) {
     if (!Array.isArray(provider.apiKeys)) {
       errors.push('"apiKeys" must be an array');
-    } else if (!provider.apiKeys.every((k) => typeof k === 'string')) {
-      errors.push('"apiKeys" must be an array of strings');
+    } else {
+      for (const k of provider.apiKeys) {
+        if (typeof k === 'string') continue; // bare string form
+        if (k && typeof k === 'object' && typeof k.value === 'string' && k.value) {
+          if (k.priority !== undefined && (typeof k.priority !== 'number' || !Number.isFinite(k.priority))) {
+            errors.push('"apiKeys[].priority" must be a finite number');
+          }
+          if (k.weight !== undefined && (typeof k.weight !== 'number' || k.weight < 0 || !Number.isFinite(k.weight))) {
+            errors.push('"apiKeys[].weight" must be a non-negative finite number');
+          }
+          continue;
+        }
+        errors.push('"apiKeys" entries must be strings or { value: string, priority?: number, weight?: number }');
+        break;
+      }
     }
   }
 
@@ -253,6 +266,42 @@ function validateProvider(provider) {
   if (provider.weight !== undefined) {
     if (typeof provider.weight !== 'number' || provider.weight < 0) {
       errors.push('"weight" must be a non-negative number');
+    }
+  }
+
+  // Key selection strategy validation (if present). The strategy is
+  // resolved at runtime by the ApiKeyManager; here we only check it is a
+  // non-empty string. Unknown values are accepted (the manager falls back
+  // to round-robin with a warning) so custom strategies can be registered.
+  if (provider.keySelectionStrategy !== undefined && provider.keySelectionStrategy !== null) {
+    if (typeof provider.keySelectionStrategy !== 'string' || provider.keySelectionStrategy.trim() === '') {
+      errors.push('"keySelectionStrategy" must be a non-empty string');
+    }
+  }
+
+  // Cooldown policy validation (if present). Cooldown durations are in ms
+  // per error category; 0 means "permanent disable" for that category.
+  if (provider.cooldownPolicy !== undefined && provider.cooldownPolicy !== null) {
+    if (typeof provider.cooldownPolicy !== 'object' || Array.isArray(provider.cooldownPolicy)) {
+      errors.push('"cooldownPolicy" must be an object');
+    } else {
+      const validCategories = ['RATE_LIMITED', 'SERVER_ERROR', 'NETWORK_ERROR', 'TIMEOUT', 'QUOTA_EXCEEDED', 'UNAUTHORIZED', 'UNKNOWN'];
+      for (const [cat, ms] of Object.entries(provider.cooldownPolicy)) {
+        if (!validCategories.includes(cat)) {
+          errors.push(`"cooldownPolicy.${cat}" is not a known category (expected one of ${validCategories.join(', ')})`);
+          continue;
+        }
+        if (typeof ms !== 'number' || ms < 0 || !Number.isFinite(ms)) {
+          errors.push(`"cooldownPolicy.${cat}" must be a non-negative finite number (ms)`);
+        }
+      }
+    }
+  }
+
+  // Cooldown failure threshold (if present)
+  if (provider.cooldownFailureThreshold !== undefined && provider.cooldownFailureThreshold !== null) {
+    if (typeof provider.cooldownFailureThreshold !== 'number' || provider.cooldownFailureThreshold < 0 || !Number.isFinite(provider.cooldownFailureThreshold)) {
+      errors.push('"cooldownFailureThreshold" must be a non-negative finite number');
     }
   }
 

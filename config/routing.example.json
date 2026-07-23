@@ -1,0 +1,4 @@
+{
+  "strategy": "priority",
+  "keySelectionStrategy": "round-robin"
+}

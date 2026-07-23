@@ -83,7 +83,7 @@ class RequestExecutor {
    * @param {number} [opts.maxRetries=2] - retry attempts per provider
    * @param {number} [opts.retryBackoffMs=200] - base backoff between retries
    */
-  constructor({ modelRouter, httpClient, adapterRegistry, usageTracker, apiKeyStore, metricsCollector, healthMonitor, requestLog }, opts = {}) {
+  constructor({ modelRouter, httpClient, adapterRegistry, usageTracker, apiKeyStore, apiKeyManager, metricsCollector, healthMonitor, requestLog }, opts = {}) {
     if (!modelRouter) throw new Error('RequestExecutor requires a modelRouter');
     if (!httpClient) throw new Error('RequestExecutor requires an httpClient');
     if (!adapterRegistry) throw new Error('RequestExecutor requires an adapterRegistry');
@@ -92,6 +92,7 @@ class RequestExecutor {
     this.adapterRegistry = adapterRegistry;
     this.usageTracker = usageTracker || null;
     this.apiKeyStore = apiKeyStore || null;
+    this.apiKeyManager = apiKeyManager || null;
     this.metricsCollector = metricsCollector || null;
     this.healthMonitor = healthMonitor || null;
     this.requestLog = requestLog || null;
@@ -107,6 +108,34 @@ class RequestExecutor {
    */
   _adapter(provider) {
     return this.adapterRegistry.getAdapter(provider);
+  }
+
+  /**
+   * Resolve the client-sent model (which may be an alias) to the canonical
+   * model id that the selected provider supports. When the model is not an
+   * alias, the input is returned unchanged. When it is an alias, the input
+   * is shallow-copied with the `model` field replaced by the first
+   * canonical id the provider serves.
+   *
+   * This ensures the provider receives a real model id it recognizes, not
+   * the gateway-internal alias.
+   *
+   * @param {string} model - the client-sent model or alias
+   * @param {object} input - the original request body
+   * @param {object} provider - the selected provider config
+   * @returns {object} the input with `model` resolved for this provider
+   * @private
+   */
+  _resolveModelForProvider(model, input, provider) {
+    if (!input || typeof input !== 'object') return input;
+    if (!this.modelRouter || typeof this.modelRouter.resolveModel !== 'function') return input;
+    const canonicalIds = this.modelRouter.resolveModel(model);
+    if (canonicalIds.length === 1 && canonicalIds[0] === model) return input;
+    // Find the first canonical id the provider supports.
+    const supported = Array.isArray(provider.supportedModels) ? provider.supportedModels : [];
+    const resolved = canonicalIds.find((id) => supported.includes(id)) || canonicalIds[0];
+    if (resolved === input.model) return input;
+    return { ...input, model: resolved };
   }
 
   /**
@@ -457,8 +486,11 @@ class RequestExecutor {
           totalRetryCount += 1;
         }
 
+        const attemptStartedAt = Date.now();
         const endpoint = this._endpoint(provider, operation);
-        const payload = this._buildPayload(provider, operation, input);
+        // Resolve the alias to the canonical model id the provider expects.
+        const providerInput = this._resolveModelForProvider(model, input, provider);
+        const payload = this._buildPayload(provider, operation, providerInput);
         const headers = this._adapterHeaders(provider);
         const attemptCtx = {
           requestId,
@@ -487,6 +519,7 @@ class RequestExecutor {
           const body = this._normalizeResponse(provider, operation, providerResponse, input);
 
           const durationMs = Date.now() - startedAt;
+          const attemptLatencyMs = Date.now() - attemptStartedAt;
           logger.info('Request completed', {
             requestId,
             model,
@@ -499,18 +532,28 @@ class RequestExecutor {
 
           // Record per-key usage (tokens, provider, model) when a usage
           // tracker and API key are attached to the request context.
+          const promptTokens = this._extractPromptTokens(body);
+          const completionTokens = this._extractCompletionTokens(body);
+          const totalTokens = this._extractTotalTokens(body);
           if (this.usageTracker && ctx.apiKey) {
             this.usageTracker.recordUsage(ctx.apiKey.id, {
               providerId: provider.id,
               model,
-              totalTokens: this._extractTotalTokens(body),
+              totalTokens,
+            });
+          }
+
+          // Record per-key health (latency + tokens) on the ApiKeyManager so
+          // health-aware key selection strategies (least-used, weighted) and
+          // the admin dashboard have fresh data.
+          if (this.apiKeyManager && providerResponse._resolvedApiKey) {
+            this.apiKeyManager.reportSuccess(provider.id, providerResponse._resolvedApiKey, {
+              latencyMs: attemptLatencyMs,
+              tokens: totalTokens,
             });
           }
 
           // Record metrics + health for the successful attempt.
-          const attemptLatencyMs = Date.now() - startedAt;
-          const promptTokens = this._extractPromptTokens(body);
-          const completionTokens = this._extractCompletionTokens(body);
           if (this.metricsCollector) {
             this.metricsCollector.recordSuccess({
               providerId: provider.id,
@@ -549,7 +592,7 @@ class RequestExecutor {
           };
         } catch (err) {
           providerError = err;
-          const failLatencyMs = Date.now() - startedAt;
+          const failLatencyMs = Date.now() - attemptStartedAt;
           if (this.metricsCollector) {
             this.metricsCollector.recordFailure({
               providerId: provider.id,

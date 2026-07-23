@@ -1,0 +1,22 @@
+{
+  "rules": [
+    {
+      "id": "skip-high-latency",
+      "description": "Skip providers with average latency > 3000ms",
+      "when": { "provider.latency": { ">": 3000 } },
+      "then": "skip"
+    },
+    {
+      "id": "skip-unhealthy",
+      "description": "Skip providers with an open circuit breaker",
+      "when": { "provider.healthy": false },
+      "then": "skip"
+    },
+    {
+      "id": "demote-low-success",
+      "description": "Demote providers with success rate below 80%",
+      "when": { "provider.successRate": { "<": 80 } },
+      "then": "demote"
+    }
+  ]
+}
