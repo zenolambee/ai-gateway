@@ -146,6 +146,7 @@ canvas.chart{width:100%;height:100%}
     <a data-tab="providers">Providers</a>
     <a data-tab="keys">API Keys</a>
     <a data-tab="models">Models</a>
+    <a data-tab="vmodels">Virtual Models</a>
     <a data-tab="logs">Logs</a>
     <a data-tab="health">Health</a>
     <a data-tab="routing">Routing</a>
@@ -208,6 +209,20 @@ canvas.chart{width:100%;height:100%}
         <table id="modelsTable" style="display:none">
           <thead><tr><th>Model</th><th>Providers</th><th>Capabilities</th><th>Owned By</th></tr></thead>
           <tbody id="modelsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- VIRTUAL MODELS (Sprint 11) -->
+  <div class="tab" id="tab-vmodels">
+    <div class="section">
+      <div class="section-hdr"><h2>Virtual Models</h2><div><button class="btn sm" onclick="showCreateVirtualModelModal()">+ Create</button><button class="btn sm gray" onclick="loadVirtualModels()" style="margin-left:8px">Refresh</button></div></div>
+      <div class="section-body">
+        <p class="muted" style="font-size:12px;margin-bottom:14px">A virtual model is an alias (e.g. <span class="mono">coding-fast</span>) that maps to one or more <span class="mono">{provider, model}</span> candidates. The gateway auto-selects the best candidate via the routing strategy and fails over across candidates of the SAME virtual model. Clients send the virtual id — no provider/model knowledge required.</p>
+        <table>
+          <thead><tr><th>Virtual Model</th><th>Status</th><th>Strategy</th><th>Candidates (provider → real model · priority · weight)</th><th>Metric Snapshot</th><th>Actions</th></tr></thead>
+          <tbody id="vmodelsBody"></tbody>
         </table>
       </div>
     </div>
@@ -378,6 +393,7 @@ function switchTab(tab) {
   if (tab === 'providers') loadProviders();
   if (tab === 'keys') loadKeys();
   if (tab === 'models') loadModels();
+  if (tab === 'vmodels') loadVirtualModels();
   if (tab === 'logs') { refreshLogs(); startLogAutoRefresh(); }
   if (tab === 'health') { loadHealth(); populateKeyHealthProviders(); }
   if (tab === 'routing') loadRouting();
@@ -990,6 +1006,223 @@ async function saveConfig() {
     toast('Save failed: ' + e.message, 'error');
   }
 }
+
+// ============================================================
+// Virtual Models Tab (Sprint 11)
+// ============================================================
+var _virtualStrategies = [];
+var _virtualMetrics = {};
+
+async function loadVirtualModels() {
+  try {
+    var d = await api('/virtual-models');
+    _virtualStrategies = d.strategies || [];
+    _virtualMetrics = d.metrics || {};
+    renderVirtualModels(d.virtualModels || []);
+  } catch (e) {
+    toast('Failed to load virtual models: ' + e.message, 'error');
+  }
+}
+
+function renderVirtualModels(list) {
+  window._vmCache = list;
+  var body = document.getElementById('vmodelsBody');
+  if (!list.length) {
+    body.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">No virtual models configured. Click <span class="mono">+ Create</span> to add one.</td></tr>';
+    return;
+  }
+  body.innerHTML = list.map(function (vm) {
+    var statusBadge = vm.enabled
+      ? '<span class="badge green">enabled</span>'
+      : '<span class="badge gray">disabled</span>';
+    var cands = (vm.candidates || []).map(function (c, i) {
+      var tag = c.enabled ? '' : ' <span class="badge gray" style="margin-left:4px">off</span>';
+      var sep = i < vm.candidates.length - 1 ? ' &nbsp;→&nbsp; ' : '';
+      return '<span class="mono">' + esc(c.provider) + ':' + esc(c.model) + '</span> <span class="muted">p' + esc(String(c.priority)) + '·w' + esc(String(c.weight)) + '</span>' + tag + sep;
+    }).join('');
+    var m = _virtualMetrics[vm.id] || {};
+    var meta = [
+      'req=' + (m.totalRequests || 0),
+      'ok=' + (m.successfulRequests || 0),
+      'fail=' + (m.failedRequests || 0),
+      'fb=' + (m.fallbackCount || 0),
+      m.averageLatencyMs ? ('avg=' + m.averageLatencyMs + 'ms') : '',
+      m.successRate != null ? ('sr=' + m.successRate + '%') : ''
+    ].filter(Boolean).join(' · ');
+    return '<tr>'
+      + '<td class="mono">' + esc(vm.id) + '</td>'
+      + '<td>' + statusBadge + '</td>'
+      + '<td><span class="badge blue">' + esc(vm.strategy) + '</span></td>'
+      + '<td style="font-size:12px">' + (cands || '<span class="muted">—</span>') + '</td>'
+      + '<td class="muted" style="font-size:11px">' + esc(meta) + '</td>'
+      + '<td>'
+        + '<button class="btn xs gray" onclick="editVirtualModel(\'' + esc(vm.id) + '\')">Edit</button> '
+        + '<button class="btn xs ' + (vm.enabled ? 'orange' : 'green') + '" onclick="toggleVirtualModel(\'' + esc(vm.id) + '\', ' + (!vm.enabled) + ')">' + (vm.enabled ? 'Disable' : 'Enable') + '</button> '
+        + '<button class="btn xs red" onclick="deleteVirtualModel(\'' + esc(vm.id) + '\')">Delete</button>'
+      + '</td>'
+    + '</tr>';
+  }).join('');
+}
+
+async function toggleVirtualModel(id, enabled) {
+  try {
+    await api('/virtual-models/' + encodeURIComponent(id) + '/toggle', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: enabled })
+    });
+    toast('Virtual model ' + (enabled ? 'enabled' : 'disabled'), 'success');
+    loadVirtualModels();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function deleteVirtualModel(id) {
+  if (!confirm('Delete virtual model "' + id + '"? This is persisted to disk.')) return;
+  try {
+    await api('/virtual-models/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Virtual model deleted', 'success');
+    loadVirtualModels();
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+function showCreateVirtualModelModal() { virtualModelForm(null); }
+
+function editVirtualModel(id) { virtualModelForm(id); }
+
+var _vmProvidersCache = [];
+function refreshVmProviders() {
+  // Fetch the provider list directly (avoid loadProviders' tab-specific DOM writes).
+  return api('/providers').then(function (d) {
+    _vmProvidersCache = (d && d.providers) ? d.providers.map(function (p) { return { id: p.id, name: p.name }; }) : [];
+    return _vmProvidersCache;
+  }).catch(function () { _vmProvidersCache = _providersData && _providersData.length ? _providersData.map(function (p) { return { id: p.id, name: p.name }; }) : []; return _vmProvidersCache; });
+}
+
+function virtualModelForm(existingId) {
+  var existing = existingId ? (window._vmCache || []).find(function (v) { return v.id === existingId; }) : null;
+  var initialCands = existing ? existing.candidates.slice() : [{ provider: '', model: '', priority: 1, weight: 1, enabled: true }];
+  var strategies = _virtualStrategies.length ? _virtualStrategies : ['priority','round-robin','lowest-latency','least-used','lowest-cost','highest-success-rate','weighted','random'];
+
+  refreshVmProviders().then(function () {
+    renderVmModal(existingId, existing, initialCands, strategies);
+  }).catch(function () {
+    renderVmModal(existingId, existing, initialCands, strategies);
+  });
+}
+
+function renderVmModal(existingId, existing, initialCands, strategies) {
+  var candRowHtml = function (c, i) {
+    var opts = (_vmProvidersCache || []).map(function (p) {
+      return '<option value="' + esc(p.id) + '"' + (c.provider === p.id ? ' selected' : '') + '>' + esc(p.id) + '</option>';
+    }).join('');
+    return '<div class="vmodel-cand" data-idx="' + i + '" style="display:flex;gap:8px;align-items:center;margin-bottom:6px">'
+      + '<select class="vm-prov" style="flex:0 0 130px"><option value="">(provider)</option>' + opts + '</select>'
+      + '<input class="vm-model" placeholder="real model id" value="' + esc(c.model || '') + '" style="flex:1">'
+      + '<input class="vm-prio" type="number" value="' + esc(String(c.priority != null ? c.priority : 1)) + '" title="priority (lower = first)" style="flex:0 0 70px">'
+      + '<input class="vm-weight" type="number" value="' + esc(String(c.weight != null ? c.weight : 1)) + '" title="weight" style="flex:0 0 60px">'
+      + '<label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px"><input class="vm-enabled" type="checkbox" ' + (c.enabled !== false ? 'checked' : '') + '> on</label>'
+      + '<button class="btn xs red" onclick="removeVmCand(this)">×</button>'
+    + '</div>';
+  };
+
+  var html = '<div class="modal-bg" onclick="if(event.target===this)closeVmModal()">'
+    + '<div class="modal">'
+    + '<div class="modal-hdr">' + (existing ? 'Edit Virtual Model' : 'Create Virtual Model') + '</div>'
+    + '<div class="modal-body">'
+    + '<div class="form-group"><label>Virtual Model ID</label><input id="vmId" placeholder="e.g. coding-fast" ' + (existing ? 'value="' + esc(existing.id) + '" disabled' : '') + '></div>'
+    + '<div class="form-row">'
+      + '<div class="form-group"><label>Status</label><select id="vmEnabled"><option value="true"' + (!existing || existing.enabled ? ' selected' : '') + '>enabled</option><option value="false"' + (existing && !existing.enabled ? ' selected' : '') + '>disabled</option></select></div>'
+      + '<div class="form-group"><label>Routing Strategy</label><select id="vmStrategy">' + strategies.map(function (s) { return '<option value="' + s + '"' + (existing && existing.strategy === s ? ' selected' : '') + '>' + s + '</option>'; }).join('') + '</select></div>'
+    + '</div>'
+    + '<div class="form-group"><label>Candidates (fallback order)</label><div id="vmCandidates">' + initialCands.map(candRowHtml).join('') + '</div>'
+      + '<button class="btn sm gray" onclick="addVmCand()" style="margin-top:6px">+ Add candidate</button>'
+      + '<div class="hint">Lower priority = tried first. Weight applies to <span class="mono">weighted</span>/<span class="mono">random</span> strategies. Disable a candidate to keep it configured but skip it.</div>'
+    + '</div>'
+    + '</div>'
+    + '<div class="modal-ftr"><button class="btn gray" onclick="closeVmModal()">Cancel</button> <button class="btn green" onclick="saveVmForm(' + (existing ? '\'' + esc(existing.id) + '\'' : 'null') + ')">Save</button></div>'
+    + '</div></div>';
+
+  document.getElementById('modalContainer').innerHTML = html;
+}
+
+function addVmCand() {
+  var box = document.getElementById('vmCandidates');
+  if (!box) return;
+  var i = box.children.length;
+  var opts = (_vmProvidersCache || []).map(function (p) {
+    return '<option value="' + esc(p.id) + '">' + esc(p.id) + '</option>';
+  }).join('');
+  var div = document.createElement('div');
+  div.className = 'vmodel-cand';
+  div.setAttribute('data-idx', String(i));
+  div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px';
+  div.innerHTML = '<select class="vm-prov" style="flex:0 0 130px"><option value="">(provider)</option>' + opts + '</select>'
+    + '<input class="vm-model" placeholder="real model id" value="" style="flex:1">'
+    + '<input class="vm-prio" type="number" value="100" style="flex:0 0 70px">'
+    + '<input class="vm-weight" type="number" value="1" style="flex:0 0 60px">'
+    + '<label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px"><input class="vm-enabled" type="checkbox" checked> on</label>'
+    + '<button class="btn xs red" onclick="removeVmCand(this)">×</button>';
+  box.appendChild(div);
+}
+
+function removeVmCand(btn) {
+  var row = btn.closest('.vmodel-cand');
+  if (row) row.remove();
+  if (!document.getElementById('vmCandidates').children.length) addVmCand();
+}
+
+function collectVmCandidates() {
+  var rows = document.querySelectorAll('#vmCandidates .vmodel-cand');
+  var cands = [];
+  rows.forEach(function (row) {
+    cands.push({
+      provider: row.querySelector('.vm-prov').value,
+      model: row.querySelector('.vm-model').value.trim(),
+      priority: parseInt(row.querySelector('.vm-prio').value, 10) || 100,
+      weight: parseFloat(row.querySelector('.vm-weight').value) || 1,
+      enabled: row.querySelector('.vm-enabled').checked
+    });
+  });
+  return cands.filter(function (c) { return c.provider && c.model; });
+}
+
+async function saveVmForm(existingId) {
+  var id = existingId || document.getElementById('vmId').value.trim();
+  if (!id) { toast('Virtual model id is required', 'error'); return; }
+  var enabled = document.getElementById('vmEnabled').value === 'true';
+  var strategy = document.getElementById('vmStrategy').value;
+  var candidates = collectVmCandidates();
+  if (!candidates.length) { toast('At least one valid candidate is required (provider + model)', 'error'); return; }
+
+  var body = { enabled: enabled, strategy: strategy, candidates: candidates };
+  try {
+    if (existingId) {
+      await api('/virtual-models/' + encodeURIComponent(existingId), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+    } else {
+      await api('/virtual-models', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ id: id }, body))
+      });
+    }
+    toast('Virtual model saved & persisted', 'success');
+    editVmCacheDirty = true;
+    closeVmModal();
+    loadVirtualModels();
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+var editVmCacheDirty = false;
+function closeVmModal() { document.getElementById('modalContainer').innerHTML = ''; }
+
+// Patch loadVirtualModels to also cache the list for the edit form (so
+// editVirtualModel finds the entry without an extra request).
+var _origRenderVirtualModels = null;
+(function patch() {
+  if (_origRenderVirtualModels) return;
+  _origRenderVirtualModels = renderVirtualModels;
+})();
 
 // ============================================================
 // Init

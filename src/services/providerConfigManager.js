@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
 const { loadProviders } = require('../config/providersConfig');
+const { loadVirtualModelsConfig, saveVirtualModelsConfig, validateVirtualModelsConfig } = require('../config/virtualModelsConfig');
 
 /**
  * ProviderConfigManager
@@ -49,6 +50,7 @@ class ProviderConfigManager {
     aliasResolver,
     ruleEngine,
     discovery,
+    virtualModelRegistry,
   } = {}, opts = {}) {
     this.providerManager = providerManager;
     this.adapterRegistry = adapterRegistry || null;
@@ -61,9 +63,11 @@ class ProviderConfigManager {
     this.aliasResolver = aliasResolver || null;
     this.ruleEngine = ruleEngine || null;
     this.discovery = discovery || null;
+    this.virtualModelRegistry = virtualModelRegistry || null;
 
     this.debounceMs = opts.debounceMs !== undefined ? opts.debounceMs : 100;
     this._watcher = null;
+    this._parentWatcher = null;
     this._debounceTimer = null;
     this._reloadCount = 0;
     this._reloadFailures = 0;
@@ -92,15 +96,40 @@ class ProviderConfigManager {
     } catch (err) {
       logger.error('ProviderConfigManager: failed to start watcher', { error: err.message });
     }
+
+    // Also watch the parent config dir for top-level config files that are
+    // not under config/providers/ (e.g. config/virtualModels.json,
+    // config/aliases.json). The provider-dir watcher above does not see those.
+    const parentDir = path.dirname(dir);
+    try {
+      this._parentWatcher = fs.watch(parentDir, { recursive: false }, (eventType, filename) => {
+        if (!filename) return;
+        // Hot reload only the config files we know how to reload.
+        if (filename === 'virtualModels.json') {
+          this.reloadVirtualModels();
+          return;
+        }
+        if (filename === 'aliases.json' || filename === 'routingRules.json' || filename === 'routing.json') {
+          this._scheduleReload();
+        }
+      });
+      if (this._parentWatcher && this._parentWatcher.unref) this._parentWatcher.unref();
+    } catch (err) {
+      logger.warn('ProviderConfigManager: failed to watch parent config dir', { error: err.message });
+    }
   }
 
   /**
-   * Stop watching the config directory.
+   * Stop watching the config directories.
    */
   stopWatching() {
     if (this._watcher) {
       this._watcher.close();
       this._watcher = null;
+    }
+    if (this._parentWatcher) {
+      this._parentWatcher.close();
+      this._parentWatcher = null;
     }
     if (this._debounceTimer) {
       clearTimeout(this._debounceTimer);
@@ -237,6 +266,88 @@ class ProviderConfigManager {
         logger.warn('ProviderConfigManager: ruleEngine.load failed', { error: e && e.message });
       }
     }
+
+    // Re-load virtual models from disk so config/virtualModels.json changes
+    // take effect without a restart (Sprint 11). The model registry cache is
+    // invalidated so the merged /v1/models catalog reflects the new VMs.
+    if (this.virtualModelRegistry) {
+      try {
+        this.virtualModelRegistry.load(loadVirtualModelsConfig());
+        if (this.modelRegistry && typeof this.modelRegistry.invalidate === 'function') {
+          this.modelRegistry.invalidate();
+        }
+      } catch (e) {
+        logger.warn('ProviderConfigManager: virtualModelRegistry.load failed', { error: e && e.message });
+      }
+    }
+  }
+
+  /**
+   * Reload ONLY the virtual models config from disk (validates first; on
+   * failure keeps the previous loaded set). Used by the parent-dir file
+   * watcher for config/virtualModels.json changes and by the admin API
+   * "reload virtual models" action.
+   *
+   * @returns {{ success: boolean, errors: string[], warnings: string[], count: number }}
+   */
+  reloadVirtualModels() {
+    if (!this.virtualModelRegistry) {
+      return { success: false, errors: ['virtualModelRegistry not attached'], warnings: [], count: 0 };
+    }
+    const raw = loadVirtualModelsConfig();
+    const { valid, errors, warnings, config } = validateVirtualModelsConfig(raw);
+    if (!valid) {
+      logger.warn('ProviderConfigManager: virtualModels hot-reload validation failed, keeping previous config', { errors });
+      return { success: false, errors, warnings, count: 0 };
+    }
+    this.virtualModelRegistry.load(config);
+    if (this.modelRegistry && typeof this.modelRegistry.invalidate === 'function') {
+      this.modelRegistry.invalidate();
+    }
+    logger.info('ProviderConfigManager: virtual models reloaded', {
+      virtualModels: Object.keys(config.virtualModels).length,
+    });
+    return {
+      success: true,
+      errors: [],
+      warnings,
+      count: Object.keys(config.virtualModels).length,
+    };
+  }
+
+  /**
+   * Persist the full virtual-model set and reload (admin API "save virtual
+   * models"). Validates BEFORE writing — on validation failure nothing is
+   * written and the running config is left untouched.
+   *
+   * The `raw` argument is the new full config shape
+   *   { virtualModels: { [id]: { enabled, strategy, candidates } } }
+   * and completely replaces the on-disk config (this is intentional: the
+   * admin dashboard sends the complete edited set, mirroring how the
+   * provider config editor works).
+   *
+   * @param {object} raw
+   * @returns {{ success: boolean, errors: string[], warnings: string[], count: number }}
+   */
+  saveVirtualModels(raw) {
+    if (!this.virtualModelRegistry) {
+      return { success: false, errors: ['virtualModelRegistry not attached'], warnings: [], count: 0 };
+    }
+    const result = saveVirtualModelsConfig(raw);
+    if (!result.success) {
+      return { success: false, errors: result.errors, warnings: result.warnings, count: 0 };
+    }
+    // On-disk config is now valid; swap the in-memory registry to match.
+    this.virtualModelRegistry.load(result.config);
+    if (this.modelRegistry && typeof this.modelRegistry.invalidate === 'function') {
+      this.modelRegistry.invalidate();
+    }
+    return {
+      success: true,
+      errors: [],
+      warnings: result.warnings,
+      count: Object.keys(result.config.virtualModels).length,
+    };
   }
 
   /**

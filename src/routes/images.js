@@ -30,7 +30,7 @@ const upload = multer({
 // POST /v1/images/generations — JSON body
 router.post('/generations', async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
     const result = await imagesService.generate(req.body, ctx);
     res.status(result.status).json(result.body);
   } catch (err) {
@@ -45,7 +45,7 @@ router.post('/edits', upload.fields([
   { name: 'mask', maxCount: 1 },
 ]), async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
     // Merge multer-parsed files into the body so the service/adapter can
     // access them uniformly via body.image / body.mask.
     const body = { ...req.body };
@@ -62,7 +62,7 @@ router.post('/edits', upload.fields([
 // Fields: image (file, required), model, n, size, response_format, user
 router.post('/variations', upload.single('image'), async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
     const body = { ...req.body };
     if (req.file) body.image = req.file;
     const result = await imagesService.variation(body, ctx);

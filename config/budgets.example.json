@@ -1,0 +1,27 @@
+{
+  "enabled": false,
+  "budgets": [
+    {
+      "id": "global-monthly",
+      "name": "Global Monthly Spend",
+      "scope": "global",
+      "window": "monthly",
+      "limit": 1000,
+      "currency": "USD",
+      "onExceed": "stop",
+      "warnThresholdPercent": 80,
+      "stopThresholdPercent": 100
+    },
+    {
+      "id": "daily-team-a",
+      "name": "Team A Daily Cap",
+      "scope": "project",
+      "scopeId": "team-a",
+      "window": "daily",
+      "limit": 50,
+      "currency": "USD",
+      "onExceed": "warn",
+      "warnThresholdPercent": 70
+    }
+  ]
+}

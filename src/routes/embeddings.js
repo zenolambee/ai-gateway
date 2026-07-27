@@ -17,7 +17,7 @@ const { embeddingsService } = require('../services');
  */
 router.post('/', async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
     const result = await embeddingsService.create(req.body, ctx);
     res.status(result.status).json(result.body);
   } catch (err) {

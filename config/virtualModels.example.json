@@ -1,0 +1,154 @@
+{
+  "virtualModels": {
+    "coding-fast": {
+      "enabled": true,
+      "strategy": "priority",
+      "candidates": [
+        {
+          "provider": "nvidia",
+          "model": "glm-5.2",
+          "priority": 1,
+          "weight": 1
+        },
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v3",
+          "priority": 2,
+          "weight": 1
+        },
+        {
+          "provider": "openrouter",
+          "model": "qwen-coder",
+          "priority": 3,
+          "weight": 1
+        }
+      ]
+    },
+    "coding-premium": {
+      "enabled": true,
+      "strategy": "highest-success-rate",
+      "candidates": [
+        {
+          "provider": "nvidia",
+          "model": "glm-5.2",
+          "priority": 1,
+          "weight": 2
+        },
+        {
+          "provider": "deepseek",
+          "model": "deepseek-r1",
+          "priority": 2,
+          "weight": 1
+        }
+      ]
+    },
+    "reasoning": {
+      "enabled": true,
+      "strategy": "round-robin",
+      "candidates": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-r1",
+          "priority": 1,
+          "weight": 1
+        },
+        {
+          "provider": "openrouter",
+          "model": "o1-mini",
+          "priority": 2,
+          "weight": 1
+        },
+        {
+          "provider": "openai",
+          "model": "o3-mini",
+          "priority": 3,
+          "weight": 1
+        }
+      ]
+    },
+    "vision": {
+      "enabled": true,
+      "strategy": "lowest-latency",
+      "candidates": [
+        {
+          "provider": "openai",
+          "model": "gpt-4o",
+          "priority": 1,
+          "weight": 1
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-3-5-sonnet",
+          "priority": 2,
+          "weight": 1
+        },
+        {
+          "provider": "gemini",
+          "model": "gemini-2.0-flash",
+          "priority": 3,
+          "weight": 1
+        }
+      ]
+    },
+    "cheap": {
+      "enabled": true,
+      "strategy": "lowest-cost",
+      "candidates": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v3",
+          "priority": 1,
+          "weight": 1
+        },
+        {
+          "provider": "openrouter",
+          "model": "qwen-coder",
+          "priority": 2,
+          "weight": 1
+        }
+      ]
+    },
+    "balanced": {
+      "enabled": true,
+      "strategy": "weighted",
+      "candidates": [
+        {
+          "provider": "nvidia",
+          "model": "glm-5.2",
+          "priority": 1,
+          "weight": 3
+        },
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v3",
+          "priority": 2,
+          "weight": 2
+        },
+        {
+          "provider": "openrouter",
+          "model": "qwen-coder",
+          "priority": 3,
+          "weight": 1
+        }
+      ]
+    },
+    "creative": {
+      "enabled": true,
+      "strategy": "random",
+      "candidates": [
+        {
+          "provider": "anthropic",
+          "model": "claude-3-5-sonnet",
+          "priority": 1,
+          "weight": 1
+        },
+        {
+          "provider": "openai",
+          "model": "gpt-4o",
+          "priority": 2,
+          "weight": 1
+        }
+      ]
+    }
+  }
+}

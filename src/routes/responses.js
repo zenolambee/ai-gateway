@@ -14,7 +14,7 @@ const { responsesService } = require('../services');
  */
 router.post('/', async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
 
     if (req.body && req.body.stream === true) {
       await responsesService.stream(req.body, res, ctx);

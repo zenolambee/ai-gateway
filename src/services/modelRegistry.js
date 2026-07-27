@@ -37,10 +37,13 @@ class ModelRegistry {
    * @param {object} [deps.aliasResolver] - ModelAliasResolver instance
    * @param {object} [deps.healthMonitor] - ProviderHealthMonitor for health/latency enrichment
    * @param {object} [deps.discovery] - ProviderDiscovery for capability detection
+   * @param {object} [deps.virtualModelRegistry] - VirtualModelRegistry (Sprint 11);
+   *   when attached, virtual models are merged into the /v1/models catalog so
+   *   clients can discover them like any other model.
    * @param {object} [opts]
    * @param {number} [opts.cacheTtlMs=60000] - cache time-to-live in ms
    */
-  constructor({ providerManager, adapterRegistry, aliasResolver, healthMonitor, discovery }, opts = {}) {
+  constructor({ providerManager, adapterRegistry, aliasResolver, healthMonitor, discovery, virtualModelRegistry }, opts = {}) {
     if (!providerManager) throw new Error('ModelRegistry requires a providerManager');
     if (!adapterRegistry) throw new Error('ModelRegistry requires an adapterRegistry');
     this.providerManager = providerManager;
@@ -48,6 +51,7 @@ class ModelRegistry {
     this.aliasResolver = aliasResolver || null;
     this.healthMonitor = healthMonitor || null;
     this.discovery = discovery || null;
+    this.virtualModelRegistry = virtualModelRegistry || null;
     this.cacheTtlMs = typeof opts.cacheTtlMs === 'number' ? opts.cacheTtlMs : DEFAULT_CACHE_TTL_MS;
 
     // cache state
@@ -168,6 +172,54 @@ class ModelRegistry {
     if (this.aliasResolver) {
       for (const entry of byId.values()) {
         entry.aliases = this.aliasResolver.aliasesForModel(entry.id);
+      }
+    }
+
+    // Merge virtual models (Sprint 11). Each enabled virtual model becomes a
+    // catalog entry (object: 'model') so OpenAI clients can discover and
+    // request it alongside real models. The backing real-model candidates
+    // are recorded under _providers; clients never see provider internals.
+    if (this.virtualModelRegistry) {
+      const vms = this.virtualModelRegistry.listVirtualModels();
+      for (const vm of vms) {
+        if (!vm.enabled) continue;
+        if (byId.has(vm.id)) {
+          // A real model already shares the id — keep the real one and skip
+          // (a virtual id should not shadow a real model id).
+          continue;
+        }
+        const backing = [];
+        for (const c of vm.candidates) {
+          if (!c.enabled) continue;
+          const real = byId.get(c.model);
+          backing.push({
+            providerId: c.provider,
+            model: c.model,
+            priority: c.priority,
+            weight: c.weight,
+            capabilities: real ? real.capabilities : {},
+          });
+        }
+        // Capability union across enabled candidates' real models.
+        const capabilities = {};
+        for (const b of backing) {
+          if (b.capabilities) this._mergeCaps(capabilities, b.capabilities);
+        }
+        byId.set(vm.id, {
+          id: vm.id,
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'gateway',
+          providers: vm.candidates.filter((c) => c.enabled).map((c) => c.provider),
+          _providers: backing,
+          capabilities,
+          latency: 0,
+          successRate: 100,
+          priority: 100,
+          aliases: [],
+          virtual: true,
+          strategy: vm.strategy,
+        });
       }
     }
 
@@ -345,6 +397,23 @@ class ModelRegistry {
    * @private
    */
   _toRichModel(entry) {
+    if (entry.virtual) {
+      return {
+        id: entry.id,
+        object: 'model',
+        created: entry.created,
+        owned_by: entry.owned_by,
+        virtual: true,
+        strategy: entry.strategy || 'priority',
+        providers: (entry._providers || []).map((p) => ({
+          providerId: p.providerId,
+          model: p.model,
+          priority: p.priority,
+          weight: p.weight,
+        })),
+        capabilities: { ...(entry.capabilities || {}) },
+      };
+    }
     return {
       id: entry.id,
       object: 'model',

@@ -404,13 +404,16 @@ class RateLimiter {
 
   /**
    * Record actual token usage after a successful response. Updates the
-   * daily/monthly token quotas.
+   * daily/monthly token quotas. Does NOT bump the request counter
+   * (that was already incremented at admission in `check()` — line above).
+   * Avoids double-counting requests: callers passing tokens==0 produce
+   * no state change.
    * @param {string} apiKeyId
    * @param {number} tokens
    */
   recordTokens(apiKeyId, tokens) {
-    if (!this.enabled || !apiKeyId || !tokens) return;
-    this.quota.recordUsage(apiKeyId, { requests: 1, tokens }, Date.now());
+    if (!this.enabled || !apiKeyId || !tokens || tokens <= 0) return;
+    this.quota.recordUsage(apiKeyId, { tokens }, Date.now());
   }
 
   /**

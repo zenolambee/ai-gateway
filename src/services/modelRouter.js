@@ -22,6 +22,7 @@ class ModelRouter {
    * @param {object} [opts]
    * @param {string} [opts.defaultStrategy='priority'] - default routing strategy
    * @param {object} [opts.healthMonitor] - for health-aware strategies
+   * @param {object} [opts.virtualModelRegistry] - for virtual model resolution
    * @param {object} [opts.usageTracker] - reserved for future use
    */
   constructor(providerManager, opts = {}) {
@@ -33,6 +34,7 @@ class ModelRouter {
     this.healthMonitor = opts.healthMonitor || null;
     this.aliasResolver = opts.aliasResolver || null;
     this.ruleEngine = opts.ruleEngine || null;
+    this.virtualModelRegistry = opts.virtualModelRegistry || null;
     // Per-model routing overrides: { [modelId]: { strategy, providerOrder } }
     this._modelOverrides = {};
     this.strategy = this.defaultStrategy;
@@ -113,6 +115,13 @@ class ModelRouter {
    * fail over across backing models when one is unavailable — while the
    * client only ever sees the alias it sent.
    *
+   * When a VirtualModelRegistry is attached and the requested id is a
+   * configured (enabled) virtual model, the registry returns an ordered
+   * candidate list of provider objects already augmented with each provider's
+   * real model id (via __virtualModelTarget). Virtual models take
+   * precedence over plain aliases because they carry richer routing
+   * information (per-candidate priority/weight/strategy).
+   *
    * When a routing rule engine is attached, the rules are applied AFTER
    * the strategy ordering to skip/prefer/demote candidates based on
    * health, latency, cooldown, and success rate.
@@ -127,6 +136,14 @@ class ModelRouter {
   getCandidateProviders(model) {
     if (!model || typeof model !== 'string') {
       return [];
+    }
+
+    // 0. Virtual model fast path: if the requested id is a configured
+    //    virtual model, ask the registry for the ordered candidates.
+    //    Each candidate carries __virtualModelTarget.model = the real
+    //    model id the executor should send to that provider.
+    if (this.virtualModelRegistry && this.virtualModelRegistry.isVirtualModel(model)) {
+      return this.virtualModelRegistry.resolveCandidates(model);
     }
 
     // 1. Resolve alias to canonical model ids (returns [model] when not an alias).
@@ -193,12 +210,20 @@ class ModelRouter {
   /**
    * Resolve the canonical model id(s) for a client-sent alias or model.
    * Exposed for the RequestExecutor so it can send the real model id to
-   * the provider (providers don't know about aliases).
+   * the provider (providers don't know about aliases or virtual models).
+   *
+   * When a VirtualModelRegistry is attached and the id is a configured
+   * virtual model, returns the list of real model ids the virtual model
+   * maps to (so the executor's per-provider resolution can pick the one
+   * the selected provider actually serves).
    *
    * @param {string} aliasOrModel
    * @returns {string[]} canonical model ids (length >= 1)
    */
   resolveModel(aliasOrModel) {
+    if (this.virtualModelRegistry && this.virtualModelRegistry.isVirtualModel(aliasOrModel)) {
+      return this.virtualModelRegistry.resolve(aliasOrModel);
+    }
     if (this.aliasResolver) return this.aliasResolver.resolve(aliasOrModel);
     return [aliasOrModel];
   }

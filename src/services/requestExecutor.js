@@ -98,6 +98,16 @@ class RequestExecutor {
     this.requestLog = requestLog || null;
     this.maxRetries = opts.maxRetries !== undefined ? opts.maxRetries : DEFAULT_MAX_RETRIES;
     this.retryBackoffMs = opts.retryBackoffMs !== undefined ? opts.retryBackoffMs : DEFAULT_RETRY_BACKOFF_MS;
+    // Sprint 12 — cost / quota / budget / token-accounting hooks. All
+    // optional & late-bound (added in services/index.js AFTER the executor
+    // is constructed, identical to the existing usageTracker / rateLimiter
+    // late-binding pattern). null safely disables the hook(s).
+    this.rateLimiter = null;           // existing — already late-bound
+    this.pricingService = null;       // cost calculation
+    this.usageAccountant = null;       // token / cost ledger
+    this.quotaService = null;         // quota policy consume
+    this.budgetService = null;        // budget consume (multiple scopes)
+    this.analyticsService = null;     // anomaly checks (raises alerts)
   }
 
   /**
@@ -111,16 +121,23 @@ class RequestExecutor {
   }
 
   /**
-   * Resolve the client-sent model (which may be an alias) to the canonical
-   * model id that the selected provider supports. When the model is not an
-   * alias, the input is returned unchanged. When it is an alias, the input
-   * is shallow-copied with the `model` field replaced by the first
-   * canonical id the provider serves.
+   * Resolve the client-sent model (which may be an alias or a virtual
+   * model) to the canonical model id that the selected provider supports.
+   *
+   * When the input is not an alias, the input is returned unchanged.
+   * When it is an alias, the input is shallow-copied with the `model`
+   * field replaced by the first canonical id the provider serves.
+   *
+   * When the selected provider was resolved via the VirtualModelRegistry,
+   * it carries `__virtualModelTarget.model` — the exact real model id the
+   * virtual-model candidate declared for this provider. This takes
+   * priority over the alias resolver's union list because a virtual model
+   * explicitly binds a provider to a single backing model.
    *
    * This ensures the provider receives a real model id it recognizes, not
-   * the gateway-internal alias.
+   * the gateway-internal alias or virtual name.
    *
-   * @param {string} model - the client-sent model or alias
+   * @param {string} model - the client-sent model, alias, or virtual id
    * @param {object} input - the original request body
    * @param {object} provider - the selected provider config
    * @returns {object} the input with `model` resolved for this provider
@@ -128,6 +145,12 @@ class RequestExecutor {
    */
   _resolveModelForProvider(model, input, provider) {
     if (!input || typeof input !== 'object') return input;
+    // Virtual-model candidate target takes priority.
+    if (provider && provider.__virtualModelTarget && provider.__virtualModelTarget.model) {
+      const target = provider.__virtualModelTarget.model;
+      if (target === input.model) return input;
+      return { ...input, model: target };
+    }
     if (!this.modelRouter || typeof this.modelRouter.resolveModel !== 'function') return input;
     const canonicalIds = this.modelRouter.resolveModel(model);
     if (canonicalIds.length === 1 && canonicalIds[0] === model) return input;
@@ -289,6 +312,43 @@ class RequestExecutor {
     if (!usage || typeof usage !== 'object') return 0;
     if (typeof usage.completion_tokens === 'number') return usage.completion_tokens;
     if (typeof usage.output_tokens === 'number') return usage.output_tokens;
+    return 0;
+  }
+
+  /**
+   * Extract cached-prompt tokens (OpenAI prompt-tokens-cache / Anthropic
+   * cache_read_input_tokens). Sprint 12 — used by PricingService to bill at
+   * the cheaper cached rate. Returns 0 when not reported.
+   * @param {object} body
+   * @returns {number}
+   * @private
+   */
+  _extractCachedTokens(body) {
+    if (!body || typeof body !== 'object') return 0;
+    const usage = body.usage;
+    if (!usage || typeof usage !== 'object') return 0;
+    if (typeof usage.cached_tokens === 'number') return usage.cached_tokens;
+    if (typeof usage.prompt_tokens_details === 'object' && usage.prompt_tokens_details) {
+      if (typeof usage.prompt_tokens_details.cached_tokens === 'number') return usage.prompt_tokens_details.cached_tokens;
+    }
+    if (typeof usage.cache_read_input_tokens === 'number') return usage.cache_read_input_tokens;
+    return 0;
+  }
+
+  /**
+   * Extract reasoning tokens (OpenAI o1/o3 family). Sprint 12.
+   * @param {object} body
+   * @returns {number}
+   * @private
+   */
+  _extractReasoningTokens(body) {
+    if (!body || typeof body !== 'object') return 0;
+    const usage = body.usage;
+    if (!usage || typeof usage !== 'object') return 0;
+    if (typeof usage.reasoning_tokens === 'number') return usage.reasoning_tokens;
+    if (typeof usage.completion_tokens_details === 'object' && usage.completion_tokens_details) {
+      if (typeof usage.completion_tokens_details.reasoning_tokens === 'number') return usage.completion_tokens_details.reasoning_tokens;
+    }
     return 0;
   }
 
@@ -462,15 +522,59 @@ class RequestExecutor {
       });
     }
 
+    // Sprint 13 — apply Enterprise Policy Engine routing hints. When
+    // `ctx.policyRouting` is present (the policy middleware sets it from
+    // req.policyRouting) we honour force/select decisions BEFORE the
+    // fallback loop starts. This is purely additive — when no policy
+    // engine is attached or no decision was reached, the candidates
+    // list is returned unchanged (full backward compat with existing
+    // ModelRouter + RoutingStrategy + RoutingRuleEngine ordering).
+    if (ctx.policyRouting) {
+      const pr = ctx.policyRouting;
+      // force_provider: keep ONLY the matching candidate (when it exists).
+      if (pr.forceProvider) {
+        const forced = candidates.find((c) => c.id === pr.forceProvider);
+        if (forced) candidates = [forced];
+      }
+      // select_provider: move the matching candidate to the front (soft pref).
+      else if (pr.selectProvider) {
+        const idx = candidates.findIndex((c) => c.id === pr.selectProvider);
+        if (idx > 0) {
+          const [c] = candidates.splice(idx, 1);
+          candidates.unshift(c);
+        }
+      }
+      // select_virtual_model: when the requested model wasn't a VM but the
+      // policy mandates one, reroute through the VM's candidates.
+      if (pr.selectVirtualModel && this.modelRouter && this.modelRouter.virtualModelRegistry) {
+        const vmr = this.modelRouter.virtualModelRegistry;
+        if (vmr.isVirtualModel(pr.selectVirtualModel)) {
+          const vmCands = vmr.resolveCandidates(pr.selectVirtualModel);
+          if (vmCands.length > 0) candidates = vmCands;
+        }
+      }
+      // force_model: handled by the _resolveModelForProvider() step below
+      // — we stash the forced model on ctx so the executor sends it to the
+      // provider instead of the originally requested model.
+      if (pr.forceModel) ctx._forcedModel = pr.forceModel;
+    }
+
     // Record request start in metrics (global + first provider).
     if (this.metricsCollector) {
-      this.metricsCollector.recordRequestStart({ providerId: candidates[0].id });
+      this.metricsCollector.recordRequestStart({
+        providerId: candidates[0].id,
+        virtualModelId: candidates[0].__virtualModelId,
+      });
     }
 
     let lastError = null;
     let fallbackCount = 0;
     let totalRetryCount = 0;
     const startedAt = Date.now();
+    // Track the virtual model id for this request (if any) so we can attribute
+    // downstream events (success/failure/fallback) back to the virtual model
+    // even when the first candidate is skipped via fallback.
+    const virtualModelId = candidates[0] && candidates[0].__virtualModelId;
 
     for (let pIdx = 0; pIdx < candidates.length; pIdx += 1) {
       const provider = candidates[pIdx];
@@ -535,6 +639,8 @@ class RequestExecutor {
           const promptTokens = this._extractPromptTokens(body);
           const completionTokens = this._extractCompletionTokens(body);
           const totalTokens = this._extractTotalTokens(body);
+          const cachedTokens = this._extractCachedTokens(body);
+          const reasoningTokens = this._extractReasoningTokens(body);
           if (this.usageTracker && ctx.apiKey) {
             this.usageTracker.recordUsage(ctx.apiKey.id, {
               providerId: provider.id,
@@ -542,6 +648,20 @@ class RequestExecutor {
               totalTokens,
             });
           }
+
+          // Sprint 12 — compute cost from pricing (0 when pricing disabled,
+          // staying fully backward compatible with the existing $0 reporting).
+          const resolvedModelForPricing = (provider.__virtualModelTarget && provider.__virtualModelTarget.model) || model;
+          const cost = this.pricingService
+            ? this.pricingService.calculateCost({
+                model: resolvedModelForPricing,
+                operation,
+                promptTokens,
+                completionTokens,
+                cachedTokens,
+                reasoningTokens,
+              })
+            : 0;
 
           // Record per-key health (latency + tokens) on the ApiKeyManager so
           // health-aware key selection strategies (least-used, weighted) and
@@ -553,7 +673,10 @@ class RequestExecutor {
             });
           }
 
-          // Record metrics + health for the successful attempt.
+          // Record metrics + health for the successful attempt. (Sprint 12:
+          // now passes `cost` so the existing `totalCost` field finally
+          // populates — backwards compatible because callers already destructure
+          // it.)
           if (this.metricsCollector) {
             this.metricsCollector.recordSuccess({
               providerId: provider.id,
@@ -562,6 +685,8 @@ class RequestExecutor {
               fallbackCount,
               promptTokens,
               completionTokens,
+              cost,
+              virtualModelId: provider.__virtualModelId,
             });
           }
           if (this.healthMonitor) {
@@ -580,6 +705,72 @@ class RequestExecutor {
             });
           }
 
+          // Sprint 12 — token-quota consume (existing rateLimiter hook was
+          // wired but never called; this finally plumbs actual token counts
+          // into the per-key daily/monthly token quotas).
+          if (this.rateLimiter && this.rateLimiter.enabled && ctx.apiKey && totalTokens > 0) {
+            try { this.rateLimiter.recordTokens(ctx.apiKey.id, totalTokens); } catch (_) { /* never block */ }
+          }
+
+          // Sprint 12 — UsageAccountant ledger (dimensional rollups + cost + entry).
+          if (this.usageAccountant) {
+            try {
+              this.usageAccountant.recordRequest({
+                requestId,
+                apiKeyId: ctx.apiKey ? ctx.apiKey.id : null,
+                providerId: provider.id,
+                model: resolvedModelForPricing,
+                virtualModelId: provider.__virtualModelId || null,
+                userId: ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null,
+                organizationId: ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null,
+                projectId: ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null,
+                operation,
+                status: 200,
+                latencyMs: durationMs,
+                inputTokens: promptTokens,
+                outputTokens: completionTokens,
+                cachedTokens,
+                reasoningTokens,
+                totalTokens,
+                cost,
+              });
+            } catch (_) { /* ledger is best-effort; never block a response */ }
+          }
+
+          // Sprint 12 — QuotaService.consume across every applicable scope.
+          if (this.quotaService && this.quotaService.enabled) {
+            try {
+              this.quotaService.consume({
+                apiKeyId: ctx.apiKey ? ctx.apiKey.id : null,
+                providerId: provider.id,
+                virtualModelId: provider.__virtualModelId || null,
+                userId: ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null,
+                organizationId: ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null,
+                projectId: ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null,
+                inputTokens: promptTokens,
+                outputTokens: completionTokens,
+                totalTokens,
+                cost,
+              });
+            } catch (_) { /* never block */ }
+          }
+
+          // Sprint 12 — BudgetService.consume across every matching scope.
+          if (this.budgetService && this.budgetService.enabled && cost > 0) {
+            try {
+              const scopeUser = ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null;
+              const scopeOrg = ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null;
+              const scopeProj = ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null;
+              // Global is always charged
+              this.budgetService.consume({ scope: 'global', scopeId: null, cost });
+              if (scopeProj) this.budgetService.consume({ scope: 'project', scopeId: scopeProj, cost });
+              if (scopeOrg) this.budgetService.consume({ scope: 'organization', scopeId: scopeOrg, cost });
+              if (scopeUser) this.budgetService.consume({ scope: 'user', scopeId: scopeUser, cost });
+            } catch (_) { /* never block */ }
+          }
+
+          // Sprint 12 — pass cost to the public meta so callers / clients can
+          // observe the charge transparently.
           return {
             status: 200,
             body,
@@ -588,6 +779,11 @@ class RequestExecutor {
               retryCount: totalRetryCount,
               fallbackCount,
               latencyMs: durationMs,
+              virtualModelId: provider.__virtualModelId || null,
+              cost,
+              promptTokens,
+              completionTokens,
+              totalTokens,
             },
           };
         } catch (err) {
@@ -598,6 +794,7 @@ class RequestExecutor {
               providerId: provider.id,
               errorCode: err.info && err.info.code,
               latencyMs: failLatencyMs,
+              virtualModelId: provider.__virtualModelId,
             });
           }
           if (this.healthMonitor) {
@@ -633,6 +830,7 @@ class RequestExecutor {
             this.metricsCollector.recordFallback({
               fromProviderId: provider.id,
               toProviderId: candidates[pIdx + 1].id,
+              virtualModelId,
             });
           }
           logger.warn('Falling back to next provider', {
@@ -807,17 +1005,92 @@ class RequestExecutor {
             fallbackCount,
           });
 
-          // Record metrics + health for the successful stream.
+          // Sprint 12 — for streams, token usage may or may not be reported.
+          // The formatter/adapter exposes any final usage it captured via
+          // `streamAdapter.getLastUsage()` (best-effort; returns null when
+          // the format has no usage). Stream cost accounting is *additive*
+          // — when no usage is available we bill $0 and just record the
+          // request (so the analytics path can still count streams).
+          let streamUsage = null;
+          try {
+            if (streamAdapter && typeof streamAdapter.getLastUsage === 'function') {
+              streamUsage = streamAdapter.getLastUsage();
+            }
+          } catch (_) { streamUsage = null; }
+          const streamPrompt = (streamUsage && typeof streamUsage.prompt_tokens === 'number') ? streamUsage.prompt_tokens
+            : (streamUsage && typeof streamUsage.input_tokens === 'number') ? streamUsage.input_tokens : 0;
+          const streamCompletion = (streamUsage && typeof streamUsage.completion_tokens === 'number') ? streamUsage.completion_tokens
+            : (streamUsage && typeof streamUsage.output_tokens === 'number') ? streamUsage.output_tokens : 0;
+          const streamTotal = (streamUsage && typeof streamUsage.total_tokens === 'number') ? streamUsage.total_tokens : (streamPrompt + streamCompletion);
+          const resolvedStreamModel = (provider.__virtualModelTarget && provider.__virtualModelTarget.model) || model;
+          const streamCost = this.pricingService
+            ? this.pricingService.calculateCost({ model: resolvedStreamModel, operation, promptTokens: streamPrompt, completionTokens: streamCompletion })
+            : 0;
+
+          // Record metrics + health for the successful stream. Includes cost.
           if (this.metricsCollector) {
             this.metricsCollector.recordSuccess({
               providerId: provider.id,
               latencyMs: durationMs,
               retryCount: totalRetryCount,
               fallbackCount,
+              promptTokens: streamPrompt,
+              completionTokens: streamCompletion,
+              cost: streamCost,
+              virtualModelId: provider.__virtualModelId,
             });
           }
           if (this.healthMonitor) {
             this.healthMonitor.recordSuccess({ providerId: provider.id, latencyMs: durationMs });
+          }
+
+          if (this.rateLimiter && this.rateLimiter.enabled && ctx.apiKey && streamTotal > 0) {
+            try { this.rateLimiter.recordTokens(ctx.apiKey.id, streamTotal); } catch (_) {}
+          }
+          if (this.usageAccountant) {
+            try {
+              this.usageAccountant.recordRequest({
+                requestId,
+                apiKeyId: ctx.apiKey ? ctx.apiKey.id : null,
+                providerId: provider.id,
+                model: resolvedStreamModel,
+                virtualModelId: provider.__virtualModelId || null,
+                userId: ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null,
+                organizationId: ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null,
+                projectId: ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null,
+                operation,
+                status: 200,
+                latencyMs: durationMs,
+                inputTokens: streamPrompt,
+                outputTokens: streamCompletion,
+                totalTokens: streamTotal,
+                cost: streamCost,
+              });
+            } catch (_) {}
+          }
+          if (this.quotaService && this.quotaService.enabled) {
+            try {
+              this.quotaService.consume({
+                apiKeyId: ctx.apiKey ? ctx.apiKey.id : null,
+                providerId: provider.id,
+                virtualModelId: provider.__virtualModelId || null,
+                userId: ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null,
+                organizationId: ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null,
+                projectId: ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null,
+                inputTokens: streamPrompt, outputTokens: streamCompletion, totalTokens: streamTotal, cost: streamCost,
+              });
+            } catch (_) {}
+          }
+          if (this.budgetService && this.budgetService.enabled && streamCost > 0) {
+            try {
+              const sUser = ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null;
+              const sOrg = ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null;
+              const sProj = ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null;
+              this.budgetService.consume({ scope: 'global', scopeId: null, cost: streamCost });
+              if (sProj) this.budgetService.consume({ scope: 'project', scopeId: sProj, cost: streamCost });
+              if (sOrg) this.budgetService.consume({ scope: 'organization', scopeId: sOrg, cost: streamCost });
+              if (sUser) this.budgetService.consume({ scope: 'user', scopeId: sUser, cost: streamCost });
+            } catch (_) {}
           }
 
           return;

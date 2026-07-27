@@ -1,0 +1,24 @@
+{
+  "enabled": false,
+  "currency": "USD",
+  "defaults": {
+    "inputToken": 0,
+    "outputToken": 0,
+    "cachedToken": 0,
+    "reasoningToken": 0,
+    "image": 0,
+    "imagePerSquareInch": 0,
+    "audio": 0,
+    "audioPerSecond": 0,
+    "embedding": 0,
+    "embeddingPerToken": 0
+  },
+  "models": {
+    "gpt-4o": { "inputToken": 0.000005, "outputToken": 0.000015, "cachedToken": 0.00000125 },
+    "gpt-4o-mini": { "inputToken": 0.00000015, "outputToken": 0.0000006 },
+    "o1": { "inputToken": 0.000015, "outputToken": 0.00006, "reasoningToken": 0.00006 },
+    "text-embedding-3-small": { "embeddingPerToken": 0.00000002 },
+    "dall-e-3": { "image": 0.04 },
+    "whisper-1": { "audioPerSecond": 0.0001 }
+  }
+}

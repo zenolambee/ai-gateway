@@ -256,6 +256,16 @@ class StreamingResponseAdapter {
     }
     return [{ data: DONE }];
   }
+
+  /**
+   * Sprint 12 — return the final usage the stream captured (or null). The
+   * executor uses this for cost/token accounting when an OpenAI-style
+   * `usage` object is emitted alongside the stream's DONE event.
+   * @returns {object|null}
+   */
+  getLastUsage() {
+    return this.usage || null;
+  }
 }
 
 module.exports = StreamingResponseAdapter;

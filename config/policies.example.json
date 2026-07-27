@@ -1,0 +1,56 @@
+{
+  "enabled": false,
+  "policies": [
+    {
+      "id": "eu-region-routing",
+      "name": "Route EU users to EU providers",
+      "description": "Demonstrates region-aware routing — EU client requests prefer the EU provider.",
+      "enabled": true,
+      "priority": 10,
+      "tags": ["prod", "geo"],
+      "when": { "and": [
+        { "request.region": { "in": ["eu-west-1", "eu-central-1"] } },
+        { "request.apiKeyId": { "!=": "internal-bench" } }
+      ]},
+      "then": { "force_provider": { "providerId": "anthropic-eu" }, "log_decision": { "reason": "geo-preference" } }
+    },
+    {
+      "id": "after-hours-cost-cap",
+      "name": "Budget guard at night",
+      "description": "Off-peak hours (20:00-06:00) get a tighter cost cap.",
+      "enabled": true,
+      "priority": 20,
+      "when": { "or": [
+        { "request.hourOfDay": { ">=": 20 } },
+        { "request.hourOfDay": { "<": 6 } }
+      ]},
+      "then": { "apply_budget_limit": { "scope": "global", "maxCostPerRequest": 0.05 }, "log_decision": { "reason": "off-peak-cap" } }
+    },
+    {
+      "id": "internal-bench-no-quota",
+      "name": "Bypass quotas for the internal benchmark key",
+      "enabled": true,
+      "priority": 5,
+      "when": { "request.apiKeyId": { "==": "internal-bench" } },
+      "then": { "apply_quota": { "bypass": true }, "log_decision": { "reason": "exempt-benchmark" } }
+    },
+    {
+      "id": "video-models-reject",
+      "name": "Reject video generation requests",
+      "enabled": false,
+      "priority": 30,
+      "when": { "request.model": { "in": ["sora-1", "veo-3"] } },
+      "then": { "reject": { "reason": "video-disabled" } }
+    },
+    {
+      "id": "default-route-priority",
+      "name": "Default fallthrough",
+      "description": "Default policy — no special routing. Implicit allow.",
+      "enabled": true,
+      "priority": 100,
+      "default": true,
+      "when": {},
+      "then": { "log_decision": { "reason": "default-allow" } }
+    }
+  ]
+}

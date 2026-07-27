@@ -5,8 +5,8 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const routes = require('./routes');
 const adminRoutes = require('./routes/admin');
-const { errorHandler, notFoundHandler, requestId, createAuthMiddleware, createRateLimitMiddleware, createAdminAuthMiddleware } = require('./middleware');
-const { apiKeyStore, usageTracker, rateLimiter, metricsCollector, providerConfigManager } = require('./services');
+const { errorHandler, notFoundHandler, requestId, createAuthMiddleware, createRateLimitMiddleware, createAdminAuthMiddleware, createQuotaMiddleware, createPolicyMiddleware } = require('./middleware');
+const { apiKeyStore, usageTracker, rateLimiter, metricsCollector, providerConfigManager, quotaService, budgetService, policyEngine, policyAudit } = require('./services');
 
 // Load gateway API keys from config (config/apiKeys.json + GATEWAY_API_KEYS env).
 apiKeyStore.load();
@@ -41,6 +41,25 @@ app.use((req, res, next) => {
   const p = req.path === '/' ? '/' : req.path.replace(/\/$/, '');
   if (PUBLIC_PATHS.has(p) || p === '/admin') return next();
   return createRateLimitMiddleware({ rateLimiter, metricsCollector })(req, res, next);
+});
+
+// Sprint 12 — Quota & Budget enforcement. Opt-in (passes through when both
+// services are disabled). Runs after rate-limit (so rate-limit headers are
+// already set) and before the policy engine (so policies can override quota
+// decisions via `apply_quota`).
+app.use((req, res, next) => {
+  const p = req.path === '/' ? '/' : req.path.replace(/\/$/, '');
+  if (PUBLIC_PATHS.has(p) || p === '/admin') return next();
+  return createQuotaMiddleware({ quotaService, budgetService })(req, res, next);
+});
+
+// Sprint 13 — Enterprise Policy Engine. Opt-in (passes through when the
+// engine is disabled). Runs after quota so it can override those decisions;
+// stashes routing hints on req.policyRouting for the executor / model router.
+app.use((req, res, next) => {
+  const p = req.path === '/' ? '/' : req.path.replace(/\/$/, '');
+  if (PUBLIC_PATHS.has(p) || p === '/admin') return next();
+  return createPolicyMiddleware({ policyEngine, policyAudit })(req, res, next);
 });
 
 // Logging

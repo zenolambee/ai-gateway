@@ -63,6 +63,27 @@ function newStats() {
   };
 }
 
+/**
+ * Create a fresh per-virtual-model stats record.
+ *
+ * A virtual model is a client-facing alias (e.g. "coding-fast") that maps
+ * to one or more { provider, model } candidates. The MetricsCollector
+ * tracks per-virtual-model counters so the admin dashboard can show
+ * which virtual models are used, which providers won selection, how
+ * many fallbacks happened, and the realised latency + success rate.
+ */
+function newVirtualModelStats() {
+  return {
+    totalRequests: 0,
+    successfulRequests: 0,
+    failedRequests: 0,
+    fallbackCount: 0,
+    latencies: [],
+    // provider id -> { selected: number, success: number, failure: number }
+    providerSelections: {},
+  };
+}
+
 class MetricsCollector {
   /**
    * @param {object} deps
@@ -78,9 +99,24 @@ class MetricsCollector {
 
     this.global = newStats();
     this.providers = new Map(); // providerId -> stats
+    // virtual model id -> per-virtual-model stats (Sprint 11)
+    this.virtualModels = new Map();
     this.startedAt = Date.now();
     this.configReloadCount = 0;
     this.configReloadFailures = 0;
+  }
+
+  /**
+   * Ensure a per-virtual-model stats record exists.
+   * @param {string} virtualModelId
+   * @returns {object}
+   * @private
+   */
+  _virtualModel(virtualModelId) {
+    if (!this.virtualModels.has(virtualModelId)) {
+      this.virtualModels.set(virtualModelId, newVirtualModelStats());
+    }
+    return this.virtualModels.get(virtualModelId);
   }
 
   /**
@@ -116,10 +152,16 @@ class MetricsCollector {
    * @param {object} detail
    * @param {string} detail.providerId
    */
-  recordRequestStart({ providerId }) {
+  recordRequestStart({ providerId, virtualModelId }) {
     if (!providerId) return;
     this.global.totalRequests += 1;
     this._provider(providerId).totalRequests += 1;
+    if (virtualModelId) {
+      const vm = this._virtualModel(virtualModelId);
+      vm.totalRequests += 1;
+      vm.providerSelections[providerId] = vm.providerSelections[providerId] || { selected: 0, success: 0, failure: 0 };
+      vm.providerSelections[providerId].selected += 1;
+    }
   }
 
   /**
@@ -134,9 +176,12 @@ class MetricsCollector {
    * @param {number} [detail.promptTokens]
    * @param {number} [detail.completionTokens]
    * @param {number} [detail.cost]
+   * @param {string} [detail.virtualModelId] - when the request targeted a
+   *   virtual model, the client-facing virtual id; routing decision is
+   *   tracked against this id (Sprint 11).
    */
   recordSuccess(detail = {}) {
-    const { providerId, latencyMs, retryCount, fallbackCount, promptTokens, completionTokens, cost } = detail;
+    const { providerId, latencyMs, retryCount, fallbackCount, promptTokens, completionTokens, cost, virtualModelId } = detail;
     if (!providerId) return;
 
     const p = this._provider(providerId);
@@ -157,6 +202,15 @@ class MetricsCollector {
     if (typeof promptTokens === 'number') this.global.promptTokens += promptTokens;
     if (typeof completionTokens === 'number') this.global.completionTokens += completionTokens;
     if (typeof cost === 'number') this.global.totalCost += cost;
+
+    if (virtualModelId) {
+      const vm = this._virtualModel(virtualModelId);
+      vm.successfulRequests += 1;
+      if (typeof latencyMs === 'number') this._recordLatency(vm, latencyMs);
+      if (typeof fallbackCount === 'number') vm.fallbackCount += fallbackCount;
+      const sel = vm.providerSelections[providerId] || (vm.providerSelections[providerId] = { selected: 0, success: 0, failure: 0 });
+      sel.success += 1;
+    }
   }
 
   /**
@@ -167,14 +221,22 @@ class MetricsCollector {
    * @param {string} detail.providerId
    * @param {string} [detail.errorCode]
    * @param {number} [detail.latencyMs]
+   * @param {string} [detail.virtualModelId]
    */
   recordFailure(detail = {}) {
-    const { providerId, latencyMs } = detail;
+    const { providerId, latencyMs, virtualModelId } = detail;
     if (!providerId) return;
 
     const p = this._provider(providerId);
     p.failedRequests += 1;
     if (typeof latencyMs === 'number') this._recordLatency(p, latencyMs);
+
+    if (virtualModelId) {
+      const vm = this._virtualModel(virtualModelId);
+      vm.failedRequests += 1;
+      const sel = vm.providerSelections[providerId] || (vm.providerSelections[providerId] = { selected: 0, success: 0, failure: 0 });
+      sel.failure += 1;
+    }
   }
 
   /**
@@ -184,11 +246,15 @@ class MetricsCollector {
    * @param {object} detail
    * @param {string} detail.fromProviderId
    * @param {string} detail.toProviderId
+   * @param {string} [detail.virtualModelId]
    */
   recordFallback(detail = {}) {
-    const { fromProviderId } = detail;
+    const { fromProviderId, virtualModelId } = detail;
     if (fromProviderId) {
       this._provider(fromProviderId).fallbackCount += 1;
+    }
+    if (virtualModelId) {
+      this._virtualModel(virtualModelId).fallbackCount += 1;
     }
   }
 
@@ -267,13 +333,18 @@ class MetricsCollector {
   }
 
   /**
-   * Return a full metrics snapshot (global + per-provider + derived counts).
+   * Return a full metrics snapshot (global + per-provider + per-virtual-model + derived counts).
    * @returns {object}
    */
   getSnapshot() {
     const providerSnapshots = {};
     for (const [id, stats] of this.providers) {
       providerSnapshots[id] = this._snapshot(stats);
+    }
+
+    const virtualModelSnapshots = {};
+    for (const [id, stats] of this.virtualModels) {
+      virtualModelSnapshots[id] = this._virtualModelSnapshot(id, stats);
     }
 
     let activeApiKeys = 0;
@@ -299,11 +370,38 @@ class MetricsCollector {
       uptimeMs: Date.now() - this.startedAt,
       global: this._snapshot(this.global),
       providers: providerSnapshots,
+      virtualModels: virtualModelSnapshots,
       activeApiKeys,
       activeProviders,
       disabledProviders,
       configReloadCount: this.configReloadCount,
       configReloadFailures: this.configReloadFailures,
+    };
+  }
+
+  /**
+   * Compute a snapshot of per-virtual-model stats for the admin dashboard.
+   * @param {string} id
+   * @param {object} stats
+   * @returns {object}
+   * @private
+   */
+  _virtualModelSnapshot(id, stats) {
+    const sorted = [...stats.latencies].sort((a, b) => a - b);
+    const total = stats.successfulRequests + stats.failedRequests;
+    return {
+      virtualModelId: id,
+      totalRequests: stats.totalRequests,
+      successfulRequests: stats.successfulRequests,
+      failedRequests: stats.failedRequests,
+      fallbackCount: stats.fallbackCount,
+      successRate: total > 0 ? Math.round((stats.successfulRequests / total) * 10000) / 100 : 100,
+      averageLatencyMs: sorted.length > 0 ? Math.round(sorted.reduce((s, v) => s + v, 0) / sorted.length) : 0,
+      p50LatencyMs: Math.round(percentile(sorted, 50)),
+      p95LatencyMs: Math.round(percentile(sorted, 95)),
+      p99LatencyMs: Math.round(percentile(sorted, 99)),
+      sampleCount: sorted.length,
+      providerSelections: stats.providerSelections,
     };
   }
 
@@ -352,6 +450,7 @@ class MetricsCollector {
   reset() {
     this.global = newStats();
     this.providers.clear();
+    this.virtualModels.clear();
     this.startedAt = Date.now();
   }
 }

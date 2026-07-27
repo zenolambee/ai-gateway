@@ -5,7 +5,11 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
+    "dev": "nodemon src/server.js",
+    "test": "node scripts/run-tests.js",
+    "test:unit": "node scripts/run-tests.js unit",
+    "test:integration": "node scripts/run-tests.js integration",
+    "test:regression": "node scripts/run-tests.js regression"
   },
   "keywords": [
     "ai",

@@ -21,7 +21,10 @@ const {
   aliasResolver,
   ruleEngine,
   discovery,
+  virtualModelRegistry,
+  virtualModelsConfig,
 } = require('../services');
+const { SELECTION_STRATEGIES, validateVirtualModelsConfig } = require('../config/virtualModelsConfig');
 
 /**
  * Admin API routes.
@@ -45,6 +48,13 @@ const {
  *   GET  /admin/api/health             — provider health overview
  *   GET  /admin/api/config             — current configuration
  *   PUT  /admin/api/config             — live edit configuration
+ *   GET  /admin/api/virtual-models      — list virtual models (Sprint 11)
+ *   GET  /admin/api/virtual-models/:id  — single virtual model
+ *   POST /admin/api/virtual-models      — create virtual model
+ *   PUT  /admin/api/virtual-models/:id  — update virtual model (replace)
+ *   DELETE /admin/api/virtual-models/:id — delete virtual model
+ *   PUT  /admin/api/virtual-models/:id/toggle — enable/disable
+ *   PUT  /admin/api/virtual-models      — bulk replace + persist
  */
 
 // --- Overview ---
@@ -738,6 +748,219 @@ router.post('/refresh-capabilities', async (req, res, next) => {
  */
 router.get('/discovery-status', (req, res) => {
   res.json({ status: discovery.getStatus() });
+});
+
+// ---------------------------------------------------------------
+// Virtual Models (Sprint 11)
+// ---------------------------------------------------------------
+
+/**
+ * Persist the current in-memory virtual model set to disk and reload so the
+ * on-disk config stays consistent with the running registry. Shared by the
+ * single-resource POST/PUT/DELETE/toggle handlers so partial edits also get
+ * saved — without requiring the admin to send the full set each time.
+ *
+ * Returns the save result (success/errors/warnings/count). When persistence
+ * is not desired (e.g. tests), `opts.persist` may be set to false.
+ * @private
+ */
+function persistVirtualModels(opts = {}) {
+  if (opts.persist === false) return { success: true, errors: [], warnings: [], count: 0 };
+  // Rebuild the full config from the registry so persistence reflects the
+  // exact runtime state (including candidate priorities/weights/enabled).
+  const virtualModels = {};
+  for (const vm of virtualModelRegistry.listVirtualModels()) {
+    virtualModels[vm.id] = {
+      enabled: vm.enabled,
+      strategy: vm.strategy,
+      candidates: vm.candidates.map((c) => ({
+        provider: c.provider,
+        model: c.model,
+        priority: c.priority,
+        weight: c.weight,
+        enabled: c.enabled,
+      })),
+    };
+  }
+  return providerConfigManager.saveVirtualModels({ virtualModels });
+}
+
+/**
+ * GET /admin/api/virtual-models
+ *
+ * List all configured virtual models with their candidate providers and
+ * per-virtual-model metrics. Includes the list of selection strategies the
+ * client may assign (so the dashboard can populate its dropdown).
+ */
+router.get('/virtual-models', (req, res) => {
+  res.json({
+    virtualModels: virtualModelRegistry.listVirtualModels(),
+    strategies: SELECTION_STRATEGIES,
+    metrics: (metricsCollector.getSnapshot().virtualModels) || {},
+  });
+});
+
+/**
+ * GET /admin/api/virtual-models/:id
+ *
+ * Retrieve a single virtual model.
+ */
+router.get('/virtual-models/:id', (req, res, next) => {
+  const vm = virtualModelRegistry.getVirtualModel(req.params.id);
+  if (!vm) {
+    return next(new AppError(`Virtual model "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' }));
+  }
+  res.json({ virtualModel: vm });
+});
+
+/**
+ * POST /admin/api/virtual-models
+ *
+ * Create a virtual model. Body:
+ *   { id, enabled?, strategy?, candidates: [{provider, model, priority?, weight?, enabled?}, ...] }
+ * Validates before registering. When persist is true (default), the updated
+ * full set is written to config/virtualModels.json (hot-reloaded elsewhere).
+ */
+router.post('/virtual-models', (req, res, next) => {
+  try {
+    const { id, enabled, strategy, candidates } = req.body || {};
+    if (!id || typeof id !== 'string') {
+      throw new AppError('"id" is required', 400, { code: 'INVALID_REQUEST' });
+    }
+    if (virtualModelRegistry.isVirtualModel(id) || virtualModelRegistry.getVirtualModel(id)) {
+      throw new AppError(`Virtual model "${id}" already exists — use PUT to update`, 409, { code: 'CONFLICT' });
+    }
+    const meta = {};
+    const ok = virtualModelRegistry.setVirtualModel(id, { enabled, strategy, candidates }, meta);
+    if (!ok) {
+      throw new AppError(
+        (meta.errors && meta.errors.length) ? meta.errors.join('; ') : 'Invalid virtual model',
+        400, { code: 'INVALID_REQUEST' }
+      );
+    }
+    modelRegistry.invalidate();
+    const persist = persistVirtualModels({ persist: req.body.persist !== undefined ? req.body.persist : true });
+    if (!persist.success) {
+      // In-memory change succeeded, but persistence failed — warn but keep
+      // the runtime change (it will be lost on restart; the dashboard shows
+      // a toast).
+      res.status(201).json({
+        success: true,
+        virtualModel: virtualModelRegistry.getVirtualModel(id),
+        persistWarnings: persist.errors,
+      });
+      return;
+    }
+    res.status(201).json({
+      success: true,
+      virtualModel: virtualModelRegistry.getVirtualModel(id),
+      warnings: persist.warnings || [],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PUT /admin/api/virtual-models/:id
+ *
+ * Replace a virtual model. Body: { enabled?, strategy?, candidates: [...] }
+ * (the id comes from the path; the body id, if present, must match).
+ */
+router.put('/virtual-models/:id', (req, res, next) => {
+  try {
+    const id = req.params.id;
+    if (!virtualModelRegistry.getVirtualModel(id)) {
+      return next(new AppError(`Virtual model "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' }));
+    }
+    if (req.body && req.body.id && req.body.id !== id) {
+      throw new AppError('id in body must match the path id', 400, { code: 'INVALID_REQUEST' });
+    }
+    const { enabled, strategy, candidates } = req.body || {};
+    const meta = {};
+    const ok = virtualModelRegistry.setVirtualModel(id, { enabled, strategy, candidates }, meta);
+    if (!ok) {
+      throw new AppError(
+        (meta.errors && meta.errors.length) ? meta.errors.join('; ') : 'Invalid virtual model',
+        400, { code: 'INVALID_REQUEST' }
+      );
+    }
+    modelRegistry.invalidate();
+    const persist = persistVirtualModels({ persist: req.body && req.body.persist !== undefined ? req.body.persist : true });
+    res.json({
+      success: true,
+      virtualModel: virtualModelRegistry.getVirtualModel(id),
+      persistWarnings: persist.success ? null : persist.errors,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /admin/api/virtual-models/:id
+ *
+ * Remove a virtual model.
+ */
+router.delete('/virtual-models/:id', (req, res, next) => {
+  try {
+    const removed = virtualModelRegistry.removeVirtualModel(req.params.id);
+    if (!removed) {
+      return next(new AppError(`Virtual model "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' }));
+    }
+    modelRegistry.invalidate();
+    persistVirtualModels();
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PUT /admin/api/virtual-models/:id/toggle
+ *
+ * Enable or disable a virtual model. Body: { enabled: boolean }
+ */
+router.put('/virtual-models/:id/toggle', (req, res, next) => {
+  try {
+    const enabled = req.body && typeof req.body.enabled === 'boolean' ? req.body.enabled : !!(req.body && req.body.enabled);
+    const ok = virtualModelRegistry.setEnabled(req.params.id, enabled);
+    if (!ok) {
+      return next(new AppError(`Virtual model "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' }));
+    }
+    persistVirtualModels();
+    res.json({ success: true, id: req.params.id, enabled: virtualModelRegistry.getVirtualModel(req.params.id).enabled });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PUT /admin/api/virtual-models
+ *
+ * Bulk-replace the entire virtual model set and persist. Body:
+ *   { virtualModels: { [id]: { enabled, strategy, candidates } } }
+ * This validates the WHOLE set first and only swaps when valid — used by
+ * the dashboard's primary virtual-model editor (full edit round-trip).
+ */
+router.put('/virtual-models', (req, res, next) => {
+  try {
+    const { virtualModels } = req.body || {};
+    const result = providerConfigManager.saveVirtualModels({ virtualModels });
+    if (!result.success) {
+      throw new AppError(
+        'Validation failed: ' + (result.errors || []).join('; '),
+        400, { code: 'INVALID_REQUEST', errors: result.errors }
+      );
+    }
+    res.json({
+      success: true,
+      count: result.count,
+      warnings: result.warnings || [],
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

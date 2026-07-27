@@ -41,7 +41,7 @@ const upload = multer({
 // POST /v1/audio/speech — JSON body, binary audio response
 router.post('/speech', async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
     const result = await audioService.speech(req.body, ctx);
 
     // If the normalized body is a Buffer, write raw audio bytes with the
@@ -65,7 +65,7 @@ router.post('/speech', async (req, res, next) => {
 // Fields: file (required), model (required), language, prompt, response_format, temperature
 router.post('/transcriptions', upload.single('file'), async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
     const body = { ...req.body };
     if (req.file) body.file = req.file;
     const result = await audioService.transcribe(body, ctx);
@@ -79,7 +79,7 @@ router.post('/transcriptions', upload.single('file'), async (req, res, next) => 
 // Fields: file (required), model (required), prompt, response_format, temperature
 router.post('/translations', upload.single('file'), async (req, res, next) => {
   try {
-    const ctx = { requestId: req.requestId, apiKey: req.apiKey };
+    const ctx = { requestId: req.requestId, apiKey: req.apiKey, policyRouting: req.policyRouting || null, policyBudgetLimit: req.policyBudgetLimit || null, policyRateLimitOverride: req.policyRateLimitOverride || null, policyQuotaOverride: req.policyQuotaOverride || null };
     const body = { ...req.body };
     if (req.file) body.file = req.file;
     const result = await audioService.translate(body, ctx);

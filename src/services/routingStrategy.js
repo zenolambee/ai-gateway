@@ -19,6 +19,14 @@
  *   - weighted          : weighted random ordering (higher weight = more
  *                        likely to appear first).
  *   - random           : uniform random shuffle.
+ *   - lowest-cost      : orders by the per-provider `cost` field ascending
+ *                        (lower cost first). Falls back to priority when no
+ *                        candidate carries a cost field. Used by Virtual
+ *                        Models.
+ *   - highest-success-rate : orders by provider successRate descending
+ *                        (highest success rate first). Falls back to priority
+ *                        when no health data is available. Used by Virtual
+ *                        Models.
  *
  * Health-aware strategies (fastest-response, lowest-latency, least-used)
  * read from the `health` map (providerId -> { averageLatencyMs, totalSuccess,
@@ -249,6 +257,60 @@ register('least-used', leastUsedStrategy);
 register('weighted', weightedStrategy);
 register('random', randomStrategy);
 
+/**
+ * Lowest cost: orders by the per-provider `cost` field ascending. Falls
+ * back to priority when no candidate carries a provider config `cost`
+ * field (virtual models use the candidate's `cost` if defined).
+ *
+ * @param {Array<object>} candidates - provider configs (may carry a `cost` field)
+ * @param {object} [ctx]
+ * @returns {Array<object>}
+ */
+function lowestCostStrategy(candidates, ctx = {}) {
+  const hasCost = candidates.some((p) => typeof p.cost === 'number');
+  if (!hasCost) return priorityStrategy(candidates, ctx);
+  return candidates.sort((a, b) => {
+    const ca = typeof a.cost === 'number' ? a.cost : Infinity;
+    const cb = typeof b.cost === 'number' ? b.cost : Infinity;
+    if (ca !== cb) return ca - cb;
+    // tie-break by priority
+    const pa = typeof a.priority === 'number' ? a.priority : 100;
+    const pb = typeof b.priority === 'number' ? b.priority : 100;
+    return pa - pb;
+  });
+}
+
+/**
+ * Highest success rate: orders by provider successRate descending. Uses
+ * health data from ctx.health. Falls back to priority when no candidate
+ * has health data.
+ *
+ * @param {Array<object>} candidates
+ * @param {object} [ctx]
+ * @param {object} [ctx.health] - providerId -> { successRate }
+ * @returns {Array<object>}
+ */
+function highestSuccessRateStrategy(candidates, ctx = {}) {
+  const health = ctx.health || {};
+  const hasRate = candidates.some((p) => {
+    const h = health[p.id];
+    return h && typeof h.successRate === 'number';
+  });
+  if (!hasRate) return priorityStrategy(candidates, ctx);
+  return candidates.sort((a, b) => {
+    const ra = (health[a.id] && typeof health[a.id].successRate === 'number') ? health[a.id].successRate : 0;
+    const rb = (health[b.id] && typeof health[b.id].successRate === 'number') ? health[b.id].successRate : 0;
+    if (ra !== rb) return rb - ra; // descending
+    // tie-break by priority
+    const pa = typeof a.priority === 'number' ? a.priority : 100;
+    const pb = typeof b.priority === 'number' ? b.priority : 100;
+    return pa - pb;
+  });
+}
+
+register('lowest-cost', lowestCostStrategy);
+register('highest-success-rate', highestSuccessRateStrategy);
+
 module.exports = {
   register,
   getStrategy,
@@ -261,4 +323,6 @@ module.exports = {
   leastUsedStrategy,
   weightedStrategy,
   randomStrategy,
+  lowestCostStrategy,
+  highestSuccessRateStrategy,
 };

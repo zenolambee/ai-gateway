@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "policies": [
+    { "id": "key-daily-req", "name": "Per-key daily request cap", "scope": "api_key", "limit": "requests", "window": "daily", "value": 10000, "action": "reject" },
+    { "id": "key-month-cost", "name": "Per-key monthly cost cap", "scope": "api_key", "limit": "cost", "window": "monthly", "value": 100, "action": "reject" },
+    { "id": "provider-month-tokens", "name": "Provider monthly token ceiling", "scope": "provider", "scopeId": "openai", "limit": "total_tokens", "window": "monthly", "value": 1000000000, "action": "switch_provider" },
+    { "id": "vm-month-cost", "name": "Virtual model monthly cost", "scope": "virtual_model", "scopeId": "coding-fast", "limit": "cost", "window": "monthly", "value": 50, "action": "switch_virtual_model" },
+    { "id": "org-month-cost", "name": "Org monthly spend", "scope": "organization", "scopeId": "acme", "limit": "cost", "window": "monthly", "value": 5000, "action": "reject" },
+    { "id": "user-daily-req", "name": "User daily requests", "scope": "user", "scopeId": "user-42", "limit": "requests", "window": "daily", "value": 500, "action": "notify", "notifyTo": "admin@acme.io" }
+  ]
+}

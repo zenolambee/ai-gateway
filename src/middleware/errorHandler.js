@@ -58,6 +58,18 @@ function openAIErrorMeta(err) {
     case 'PROVIDER_DNS_ERROR':
     case 'PROVIDER_NETWORK_ERROR':
       return { type: 'api_error', code: 'provider_unreachable' };
+    // Sprint 12 — Quota & Budget Management.
+    case 'QUOTA_EXCEEDED':
+      return { type: 'rate_limit_exceeded', code: 'quota_exceeded' };
+    case 'BUDGET_EXCEEDED':
+      return { type: 'rate_limit_exceeded', code: 'budget_exceeded' };
+    case 'BUDGET_WARNING':
+      return { type: 'api_error', code: 'budget_warning' };
+    // Sprint 13 — Enterprise Policy Engine.
+    case 'POLICY_REJECT':
+      return { type: 'invalid_request_error', code: 'policy_reject' };
+    case 'POLICY_APPROVAL_REQUIRED':
+      return { type: 'invalid_request_error', code: 'policy_approval_required' };
     default:
       return { type: 'api_error', code: null };
   }
