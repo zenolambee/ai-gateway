@@ -86,8 +86,28 @@ class UsageAccountant {
     }
   }
 
+  /**
+   * Return the current date as a UTC ISO day string (YYYY-MM-DD).
+   * Public version of _day() for external callers (e.g. analytics).
+   * @param {number} [now] - timestamp (defaults to Date.now())
+   * @returns {string}
+   */
+  dayString(now) {
+    return this._day(now);
+  }
+
+  /**
+   * Return the current month as a UTC ISO month string (YYYY-MM).
+   * Public version of _month() for external callers.
+   * @param {number} [now] - timestamp
+   * @returns {string}
+   */
+  monthString(now) {
+    return this._month(now);
+  }
+
   _ensureDay(ymd) { return _ensureKey(this.byDay, ymd, aggCounters); }
-  _ensureMonth(ym) { return _ensureKey(this.byMonth, yym, aggCounters).bind(null); }
+  _ensureMonth(ym) { return _ensureKey(this.byMonth, ym, aggCounters); }
 
   _day(now) {
     const d = new Date(now);
@@ -96,10 +116,6 @@ class UsageAccountant {
   _month(now) {
     const d = new Date(now);
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-  }
-
-  _ensureMonthProper(ym) {
-    return _ensureKey(this.byMonth, ym, aggCounters);
   }
 
   /**
@@ -147,7 +163,7 @@ class UsageAccountant {
     if (entry.organizationId) this._bump(_ensureKey(this.byOrg, entry.organizationId, aggCounters), entry);
     if (entry.projectId) this._bump(_ensureKey(this.byProject, entry.projectId, aggCounters), entry);
     this._bump(this._ensureDay(this._day(now)), entry);
-    this._bump(this._ensureMonthProper(this._month(now)), entry);
+    this._bump(this._ensureMonth(this._month(now)), entry);
 
     if (this.persist && this.persistencePath && !this._flushTimer) {
       // opportunistic (lazy) flush — no timer configured, write-through
@@ -290,5 +306,3 @@ class UsageAccountant {
 }
 
 module.exports = UsageAccountant;
-module.exports.ONE_DAY_MS = ONE_DAY_MS;
-module.exports.DEFAULT_MAX_ENTRIES = DEFAULT_MAX_ENTRIES;

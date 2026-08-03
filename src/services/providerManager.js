@@ -1,6 +1,6 @@
 const logger = require('../utils/logger');
 const AppError = require('../utils/AppError');
-const { loadProviders, REQUIRED_FIELDS, validateProviderConfigs } = require('../config/providersConfig');
+const { loadProviders, REQUIRED_FIELDS, validateProviderConfigs, hasUnexpandedEnvVars } = require('../config/providersConfig');
 
 const DEFAULT_TIMEOUT_MS = 30000;
 
@@ -20,6 +20,7 @@ class ProviderManager {
     this.loaded = false;
     this._listeners = [];
     this._configDir = null;
+    this._disabledReasons = new Map();
   }
 
   /**
@@ -55,6 +56,10 @@ class ProviderManager {
    * Load and validate all provider configs from the configuration directory.
    * Should be called once at application startup.
    *
+   * Providers that fail validation are dropped from the list so the gateway
+   * can continue with the valid providers. The errors are logged and the
+   * startup summary (in server.js) reports the counts.
+   *
    * @param {string} [dir] - optional override for the providers config dir
    * @returns {ProviderManager} this instance (for chaining)
    */
@@ -72,6 +77,18 @@ class ProviderManager {
       }
     }
 
+    // Track disabled providers with their reasons for startup reporting.
+    // Providers that have `__disabledReason` were explicitly disabled by
+    // the validator (e.g. no API keys). Providers with `enabled: false`
+    // in config are intentionally disabled by the operator.
+    for (const p of providers) {
+      if (p.__disabledReason) {
+        this._disabledReasons.set(p.id, p.__disabledReason);
+      } else if (p.enabled === false) {
+        this._disabledReasons.set(p.id, 'Disabled in config');
+      }
+    }
+
     const normalized = providers.map((p) => this._normalize(p));
     this._index(normalized);
     this.loaded = true;
@@ -79,6 +96,7 @@ class ProviderManager {
     logger.info('ProviderManager initialized', {
       total: normalized.length,
       enabled: this.getEnabledProviders().length,
+      disabled: this.getDisabledProviders().length,
     });
 
     this._notify(normalized);
@@ -111,6 +129,16 @@ class ProviderManager {
       logger.warn('Provider config warning', { warning: w });
     }
 
+    // Track disabled reasons for the new set.
+    this._disabledReasons.clear();
+    for (const p of providers) {
+      if (p.__disabledReason) {
+        this._disabledReasons.set(p.id, p.__disabledReason);
+      } else if (p.enabled === false) {
+        this._disabledReasons.set(p.id, 'Disabled in config');
+      }
+    }
+
     const normalized = providers.map((p) => this._normalize(p));
 
     // Atomic swap: replace the indexes in one step.
@@ -119,6 +147,7 @@ class ProviderManager {
     logger.info('ProviderManager reloaded', {
       total: normalized.length,
       enabled: this.getEnabledProviders().length,
+      disabled: this.getDisabledProviders().length,
     });
 
     this._notify(normalized);
@@ -135,10 +164,11 @@ class ProviderManager {
     // Preserve known fields with defaults, and spread any extra provider
     // config fields (e.g. adapter, anthropicVersion, chatPath) so adapters
     // and the adapter registry can read them without changing the manager.
+    const enabled = raw.__disabledReason ? false : (raw.enabled !== undefined ? raw.enabled : true);
     const base = {
       id: raw.id,
       name: raw.name,
-      enabled: raw.enabled !== undefined ? raw.enabled : true,
+      enabled,
       baseURL: raw.baseURL,
       apiKeys: Array.isArray(raw.apiKeys) ? raw.apiKeys : [],
       supportedModels: raw.supportedModels,
@@ -152,6 +182,12 @@ class ProviderManager {
         base[key] = raw[key];
       }
     }
+
+    // Preserve the disable reason for startup reporting.
+    if (raw.__disabledReason) {
+      base.__disabledReason = raw.__disabledReason;
+    }
+
     return base;
   }
 
@@ -190,6 +226,42 @@ class ProviderManager {
    */
   getEnabledProviders() {
     return this.listProviders().filter((p) => p.enabled);
+  }
+
+  /**
+   * Return providers that are disabled (either explicitly in config or
+   * auto-disabled due to validation issues like missing API keys).
+   * Each entry is augmented with a `disabledReason` string explaining why.
+   * @returns {Array<{provider: object, reason: string}>}
+   */
+  getDisabledProviders() {
+    return this.listProviders()
+      .filter((p) => !p.enabled)
+      .map((p) => ({
+        provider: p,
+        reason: this._disabledReasons.get(p.id) || 'Disabled in config',
+      }));
+  }
+
+  /**
+   * Return the disable reason for a specific provider, or null if the
+   * provider is not disabled (or unknown).
+   * @param {string} providerId
+   * @returns {string|null}
+   */
+  getDisabledReason(providerId) {
+    return this._disabledReasons.get(providerId) || null;
+  }
+
+  /**
+   * Return the provider config directory path used during load().
+   * Falls back to env var or the default path when not set.
+   * @returns {string|null}
+   */
+  getConfigDir() {
+    return this._configDir
+      || process.env.PROVIDERS_CONFIG_DIR
+      || null;
   }
 
   /**

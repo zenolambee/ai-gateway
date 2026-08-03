@@ -108,6 +108,11 @@ class RequestExecutor {
     this.quotaService = null;         // quota policy consume
     this.budgetService = null;        // budget consume (multiple scopes)
     this.analyticsService = null;     // anomaly checks (raises alerts)
+    // Sprint: SDK Routing — late-bound SDKRoutingBridge. When set, providers
+    // with a registered SDK adapter are routed through adapter.sendRequest()
+    // (SDK-first); otherwise the legacy httpClient path runs unchanged.
+    // Null => full backward compatibility (always legacy).
+    this.sdkRouter = null;
   }
 
   /**
@@ -268,6 +273,14 @@ class RequestExecutor {
       return 'arraybuffer';
     }
     return undefined;
+  }
+
+  /**
+   * Resolve the request timeout for a provider (used by the SDK routing path).
+   * @private
+   */
+  _timeout(provider) {
+    return (provider && provider.timeout) || 30000;
   }
 
   /**
@@ -609,16 +622,30 @@ class RequestExecutor {
         logger.info('Provider request attempt', attemptCtx);
 
         try {
-          const providerResponse = await this.httpClient.sendRequest(
-            provider,
-            endpoint,
-            {
+          let providerResponse;
+          // SDK-first routing: when the provider has a registered SDK adapter
+          // and the bridge is attached, route through adapter.sendRequest().
+          // Otherwise fall back to the legacy httpClient path (unchanged).
+          if (this.sdkRouter && this.sdkRouter.hasSDK(provider)) {
+            providerResponse = await this.sdkRouter.sendRequest(provider, endpoint, {
               method: 'POST',
               body: payload,
               headers,
               responseType: this._responseType(provider, operation, input),
-            }
-          );
+              timeout: this._timeout(provider),
+            });
+          } else {
+            providerResponse = await this.httpClient.sendRequest(
+              provider,
+              endpoint,
+              {
+                method: 'POST',
+                body: payload,
+                headers,
+                responseType: this._responseType(provider, operation, input),
+              }
+            );
+          }
 
           const body = this._normalizeResponse(provider, operation, providerResponse, input);
 

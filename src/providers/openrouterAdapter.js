@@ -18,7 +18,7 @@ class OpenRouterAdapter extends GenericOpenAIAdapter {
       supportsStreaming: true,
       supportsEmbeddings: true,
       supportsImages: true,
-      supportsAudio: true,
+      supportsAudio: false,
       supportsTools: true,
       supportsReasoning: true,
     };

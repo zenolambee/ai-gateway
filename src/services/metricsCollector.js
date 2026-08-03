@@ -21,9 +21,10 @@
  *   - activeApiKeys (read from the ApiKeyManager)
  *   - activeProviders (read from the ProviderManager)
  *
- * All collection is in-memory and synchronous (O(1) per event) so it never
- * blocks request execution. Latency percentiles are computed on demand from
- * a bounded sample buffer (reservoir-style cap to avoid unbounded memory).
+ * When a storageProvider is given, counters are persisted through it
+ * (Redis or MemoryStorage). Latency samples are always kept in-memory
+ * (ephemeral). Without storageProvider, everything is in-memory
+ * (pure backward compat).
  */
 
 const DEFAULT_MAX_LATENCY_SAMPLES = 10000;
@@ -65,12 +66,6 @@ function newStats() {
 
 /**
  * Create a fresh per-virtual-model stats record.
- *
- * A virtual model is a client-facing alias (e.g. "coding-fast") that maps
- * to one or more { provider, model } candidates. The MetricsCollector
- * tracks per-virtual-model counters so the admin dashboard can show
- * which virtual models are used, which providers won selection, how
- * many fallbacks happened, and the realised latency + success rate.
  */
 function newVirtualModelStats() {
   return {
@@ -79,7 +74,6 @@ function newVirtualModelStats() {
     failedRequests: 0,
     fallbackCount: 0,
     latencies: [],
-    // provider id -> { selected: number, success: number, failure: number }
     providerSelections: {},
   };
 }
@@ -89,21 +83,60 @@ class MetricsCollector {
    * @param {object} deps
    * @param {object} [deps.providerManager] - for activeProviders count
    * @param {object} [deps.apiKeyManager] - for activeApiKeys count
+   * @param {object} [deps.storageProvider] - optional StorageProvider instance
    * @param {object} [opts]
-   * @param {number} [opts.maxLatencySamples=10000] - cap on latency samples
+   * @param {number} [opts.maxLatencySamples=10000]
    */
-  constructor({ providerManager, apiKeyManager } = {}, opts = {}) {
+  constructor({ providerManager, apiKeyManager, storageProvider } = {}, opts = {}) {
     this.providerManager = providerManager || null;
     this.apiKeyManager = apiKeyManager || null;
     this.maxLatencySamples = opts.maxLatencySamples || DEFAULT_MAX_LATENCY_SAMPLES;
+    this._store = storageProvider || null;
 
     this.global = newStats();
-    this.providers = new Map(); // providerId -> stats
-    // virtual model id -> per-virtual-model stats (Sprint 11)
+    this.providers = new Map();
     this.virtualModels = new Map();
     this.startedAt = Date.now();
     this.configReloadCount = 0;
     this.configReloadFailures = 0;
+  }
+
+  /**
+   * Persist a global counter to storage (fire-and-forget).
+   * @param {string} field
+   * @param {number} value
+   * @private
+   */
+  _persistGlobal(field, value) {
+    if (this._store) {
+      this._store.hset('metrics:global', { [field]: value }).catch(() => {});
+    }
+  }
+
+  /**
+   * Persist a per-provider counter to storage (fire-and-forget).
+   * @param {string} providerId
+   * @param {string} field
+   * @param {number} value
+   * @private
+   */
+  _persistProvider(providerId, field, value) {
+    if (this._store) {
+      this._store.hset(`metrics:providers:${providerId}`, { [field]: value }).catch(() => {});
+    }
+  }
+
+  /**
+   * Persist a per-virtual-model counter to storage (fire-and-forget).
+   * @param {string} vmId
+   * @param {string} field
+   * @param {*} value
+   * @private
+   */
+  _persistVM(vmId, field, value) {
+    if (this._store) {
+      this._store.hset(`metrics:vm:${vmId}`, { [field]: value }).catch(() => {});
+    }
   }
 
   /**
@@ -134,7 +167,7 @@ class MetricsCollector {
 
   /**
    * Record a latency sample (bounded buffer — drops oldest when full).
-   * @param {object} stats - per-provider or global stats
+   * @param {object} stats
    * @param {number} latencyMs
    * @private
    */
@@ -146,39 +179,28 @@ class MetricsCollector {
   }
 
   /**
-   * Record a request attempt start. Called by the executor at the very
-   * beginning of execute()/executeStream().
-   *
-   * @param {object} detail
-   * @param {string} detail.providerId
+   * Record a request attempt start.
    */
   recordRequestStart({ providerId, virtualModelId }) {
     if (!providerId) return;
     this.global.totalRequests += 1;
-    this._provider(providerId).totalRequests += 1;
+    this._persistGlobal('totalRequests', this.global.totalRequests);
+
+    const p = this._provider(providerId);
+    p.totalRequests += 1;
+    this._persistProvider(providerId, 'totalRequests', p.totalRequests);
+
     if (virtualModelId) {
       const vm = this._virtualModel(virtualModelId);
       vm.totalRequests += 1;
       vm.providerSelections[providerId] = vm.providerSelections[providerId] || { selected: 0, success: 0, failure: 0 };
       vm.providerSelections[providerId].selected += 1;
+      this._persistVM(virtualModelId, 'totalRequests', vm.totalRequests);
     }
   }
 
   /**
-   * Record a successful provider attempt. Called by the executor after a
-   * provider response is successfully normalized.
-   *
-   * @param {object} detail
-   * @param {string} detail.providerId
-   * @param {number} detail.latencyMs - per-attempt latency
-   * @param {number} [detail.retryCount]
-   * @param {number} [detail.fallbackCount]
-   * @param {number} [detail.promptTokens]
-   * @param {number} [detail.completionTokens]
-   * @param {number} [detail.cost]
-   * @param {string} [detail.virtualModelId] - when the request targeted a
-   *   virtual model, the client-facing virtual id; routing decision is
-   *   tracked against this id (Sprint 11).
+   * Record a successful provider attempt.
    */
   recordSuccess(detail = {}) {
     const { providerId, latencyMs, retryCount, fallbackCount, promptTokens, completionTokens, cost, virtualModelId } = detail;
@@ -193,8 +215,6 @@ class MetricsCollector {
     if (typeof completionTokens === 'number') p.completionTokens += completionTokens;
     if (typeof cost === 'number') p.totalCost += cost;
 
-    // Global mirrors the provider (not a sum, since the request succeeds on
-    // exactly one provider).
     this.global.successfulRequests += 1;
     if (typeof latencyMs === 'number') this._recordLatency(this.global, latencyMs);
     if (typeof retryCount === 'number') this.global.retryCount += retryCount;
@@ -203,6 +223,18 @@ class MetricsCollector {
     if (typeof completionTokens === 'number') this.global.completionTokens += completionTokens;
     if (typeof cost === 'number') this.global.totalCost += cost;
 
+    if (this._store) {
+      this._store.hset('metrics:global', {
+        successfulRequests: this.global.successfulRequests,
+        retryCount: this.global.retryCount,
+        fallbackCount: this.global.fallbackCount,
+        promptTokens: this.global.promptTokens,
+        completionTokens: this.global.completionTokens,
+        totalCost: this.global.totalCost,
+      }).catch(() => {});
+      this._persistProvider(providerId, 'successfulRequests', p.successfulRequests);
+    }
+
     if (virtualModelId) {
       const vm = this._virtualModel(virtualModelId);
       vm.successfulRequests += 1;
@@ -210,18 +242,14 @@ class MetricsCollector {
       if (typeof fallbackCount === 'number') vm.fallbackCount += fallbackCount;
       const sel = vm.providerSelections[providerId] || (vm.providerSelections[providerId] = { selected: 0, success: 0, failure: 0 });
       sel.success += 1;
+      if (this._store) {
+        this._persistVM(virtualModelId, 'successfulRequests', vm.successfulRequests);
+      }
     }
   }
 
   /**
-   * Record a failed provider attempt. Called by the executor in the catch
-   * block of a provider request.
-   *
-   * @param {object} detail
-   * @param {string} detail.providerId
-   * @param {string} [detail.errorCode]
-   * @param {number} [detail.latencyMs]
-   * @param {string} [detail.virtualModelId]
+   * Record a failed provider attempt.
    */
   recordFailure(detail = {}) {
     const { providerId, latencyMs, virtualModelId } = detail;
@@ -230,23 +258,21 @@ class MetricsCollector {
     const p = this._provider(providerId);
     p.failedRequests += 1;
     if (typeof latencyMs === 'number') this._recordLatency(p, latencyMs);
+    this._persistProvider(providerId, 'failedRequests', p.failedRequests);
 
     if (virtualModelId) {
       const vm = this._virtualModel(virtualModelId);
       vm.failedRequests += 1;
       const sel = vm.providerSelections[providerId] || (vm.providerSelections[providerId] = { selected: 0, success: 0, failure: 0 });
       sel.failure += 1;
+      if (this._store) {
+        this._persistVM(virtualModelId, 'failedRequests', vm.failedRequests);
+      }
     }
   }
 
   /**
-   * Record a fallback event (the executor moved from one provider to the
-   * next).
-   *
-   * @param {object} detail
-   * @param {string} detail.fromProviderId
-   * @param {string} detail.toProviderId
-   * @param {string} [detail.virtualModelId]
+   * Record a fallback event.
    */
   recordFallback(detail = {}) {
     const { fromProviderId, virtualModelId } = detail;
@@ -260,56 +286,29 @@ class MetricsCollector {
 
   /**
    * Record that a request failed entirely (all providers exhausted).
-   *
-   * @param {object} detail
-   * @param {string} [detail.providerId] - last provider that was tried
    */
   recordRequestFailure(detail = {}) {
     this.global.failedRequests += 1;
-    if (detail.providerId) {
-      // Already counted the per-provider failure in recordFailure; just
-      // bump the global.
-    }
+    this._persistGlobal('failedRequests', this.global.failedRequests);
   }
 
   /**
-   * Record a rate-limit rejection. Called by the rate-limit middleware
-   * when a request is denied (429). Increments the per-key and global
-   * rejection counters. When a providerId is given (e.g. for per-provider
-   * throttling by the executor), the per-provider counter is also bumped.
-   *
-   * @param {object} detail
-   * @param {string} [detail.scope]
-   * @param {string} [detail.apiKeyId]
-   * @param {string} [detail.providerId]
-   * @param {string} [detail.model]
+   * Record a rate-limit rejection.
    */
   recordRateLimitRejection(detail = {}) {
     this.global.rateLimitRejections += 1;
+    this._persistGlobal('rateLimitRejections', this.global.rateLimitRejections);
     if (detail.providerId) {
       this._provider(detail.providerId).rateLimitRejections += 1;
+      this._persistProvider(detail.providerId, 'rateLimitRejections', this._provider(detail.providerId).rateLimitRejections);
     }
   }
 
-  /**
-   * Record a successful configuration reload.
-   */
-  recordConfigReload() {
-    this.configReloadCount += 1;
-  }
-
-  /**
-   * Record a failed configuration reload.
-   */
-  recordConfigReloadFailure() {
-    this.configReloadFailures += 1;
-  }
+  recordConfigReload() { this.configReloadCount += 1; }
+  recordConfigReloadFailure() { this.configReloadFailures += 1; }
 
   /**
    * Compute a snapshot of the metrics for a single stats record.
-   * @param {object} stats
-   * @returns {object}
-   * @private
    */
   _snapshot(stats) {
     const sorted = [...stats.latencies].sort((a, b) => a - b);
@@ -333,8 +332,7 @@ class MetricsCollector {
   }
 
   /**
-   * Return a full metrics snapshot (global + per-provider + per-virtual-model + derived counts).
-   * @returns {object}
+   * Return a full metrics snapshot.
    */
   getSnapshot() {
     const providerSnapshots = {};
@@ -380,11 +378,7 @@ class MetricsCollector {
   }
 
   /**
-   * Compute a snapshot of per-virtual-model stats for the admin dashboard.
-   * @param {string} id
-   * @param {object} stats
-   * @returns {object}
-   * @private
+   * Compute a snapshot of per-virtual-model stats.
    */
   _virtualModelSnapshot(id, stats) {
     const sorted = [...stats.latencies].sort((a, b) => a - b);
@@ -406,8 +400,7 @@ class MetricsCollector {
   }
 
   /**
-   * Return a lightweight stats summary (no latency histograms).
-   * @returns {object}
+   * Return a lightweight stats summary.
    */
   getStats() {
     const snap = this.getSnapshot();
@@ -452,6 +445,9 @@ class MetricsCollector {
     this.providers.clear();
     this.virtualModels.clear();
     this.startedAt = Date.now();
+    if (this._store) {
+      this._store.flush().catch(() => {});
+    }
   }
 }
 

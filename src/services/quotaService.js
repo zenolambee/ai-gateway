@@ -68,14 +68,16 @@ const SCOPES = ['api_key', 'provider', 'virtual_model', 'user', 'organization', 
 class QuotaService {
   /**
    * @param {object} config - output of loadQuotaConfig()
+   * @param {object} [opts]
+   * @param {object} [opts.storageProvider] - optional StorageProvider instance
    */
-  constructor(config = {}) {
+  constructor(config = {}, opts = {}) {
     this.enabled = !!config.enabled;
     this.policies = [];
-    // counters: policyId -> { windowStart, requests, inputTokens, outputTokens, totalTokens, cost }
     this.counters = new Map();
-    this.alerts = null; // AlertService (optional, injected)
+    this.alerts = null;
     this.config = config;
+    this._store = opts.storageProvider || null;
     this.load(config);
   }
 
@@ -115,6 +117,23 @@ class QuotaService {
       c.requests = 0; c.inputTokens = 0; c.outputTokens = 0; c.totalTokens = 0; c.cost = 0;
     }
     return c;
+  }
+
+  /**
+   * Persist a policy counter to storage (fire-and-forget).
+   */
+  _persistCounter(policyId) {
+    if (!this._store) return;
+    const c = this.counters.get(policyId);
+    if (!c) return;
+    this._store.hset(`quota:${policyId}`, {
+      windowStart: c.windowStart,
+      requests: c.requests,
+      inputTokens: c.inputTokens,
+      outputTokens: c.outputTokens,
+      totalTokens: c.totalTokens,
+      cost: c.cost,
+    }).catch(() => {});
   }
 
   /**
@@ -305,6 +324,7 @@ class QuotaService {
       for (const p of policies) {
         const c = this._ensure(p.id, now);
         this._apply(c, usage);
+        this._persistCounter(p.id);
         // Quota-exhausted alert on consume (when ratio crosses 1)
         const cur = this._readCounter(c, p.limit);
         const ratio = p.value > 0 ? cur / p.value : 0;

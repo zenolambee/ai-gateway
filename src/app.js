@@ -11,6 +11,13 @@ const { apiKeyStore, usageTracker, rateLimiter, metricsCollector, providerConfig
 // Load gateway API keys from config (config/apiKeys.json + GATEWAY_API_KEYS env).
 apiKeyStore.load();
 
+// Re-hydrate persisted keys once the storage backend has had a chance to
+// upgrade to Redis (the async connection completes shortly after boot). Safe
+// to call repeatedly — hydration is idempotent.
+if (process.env.NODE_ENV !== 'test') {
+  setTimeout(() => apiKeyStore.hydrate().catch(() => {}), 1500);
+}
+
 const app = express();
 
 // Security & parsing

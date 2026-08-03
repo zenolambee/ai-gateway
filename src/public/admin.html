@@ -135,6 +135,37 @@ canvas.chart{width:100%;height:100%}
 .muted{color:var(--muted)}
 .mono{font-family:'SF Mono',Monaco,Consolas,monospace}
 .nowrap{white-space:nowrap}
+/* Sub-navigation */
+.subnav{display:flex;gap:2px;margin-bottom:16px;flex-wrap:wrap}
+.subnav a{color:var(--muted);text-decoration:none;padding:6px 14px;border-radius:8px;font-size:12px;font-weight:500;transition:all .12s;cursor:pointer}
+.subnav a:hover{color:var(--text);background:rgba(255,255,255,.06)}
+.subnav a.active{color:var(--accent);background:var(--accent-dim)}
+.stab{display:none}.stab.active{display:block}
+/* Provider grid for catalog */
+.provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.provider-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;cursor:pointer;transition:border-color .15s}
+.provider-card:hover{border-color:var(--accent)}
+.provider-card .pname{font-weight:600;font-size:14px}
+.provider-card .pauth{font-size:11px;color:var(--muted);margin-top:4px}
+.provider-card .pcaps{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.provider-card .pcaps .cap{font-size:10px;padding:2px 8px;border-radius:4px;background:var(--accent-dim);color:var(--accent)}
+/* Wizard */
+.wizard-step{padding:16px}
+.wizard-step h3{font-size:15px;margin-bottom:12px}
+.wizard-options{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.wizard-option{border:2px solid var(--border);border-radius:var(--radius);padding:14px;cursor:pointer;transition:all .12s;text-align:center}
+.wizard-option:hover{border-color:var(--accent);background:var(--accent-dim)}
+.wizard-option.selected{border-color:var(--accent);background:var(--accent-dim)}
+.wizard-option .wiz-name{font-size:14px;font-weight:600}
+.wizard-option .wiz-desc{font-size:11px;color:var(--muted);margin-top:4px}
+.form-group-json textarea{font-family:'SF Mono',Monaco,Consolas,monospace;font-size:12px;min-height:120px;resize:vertical}
+/* Connection detail */
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.detail-col{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+.detail-col h3{font-size:13px;font-weight:600;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+.detail-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px}
+.detail-row:last-child{border-bottom:none}
+.detail-row .dl{color:var(--muted)}.detail-row .dv{font-weight:500}
 </style>
 </head>
 <body>
@@ -145,6 +176,7 @@ canvas.chart{width:100%;height:100%}
     <a class="active" data-tab="overview">Overview</a>
     <a data-tab="providers">Providers</a>
     <a data-tab="keys">API Keys</a>
+    <a data-tab="accounts">Accounts</a>
     <a data-tab="models">Models</a>
     <a data-tab="vmodels">Virtual Models</a>
     <a data-tab="logs">Logs</a>
@@ -172,14 +204,45 @@ canvas.chart{width:100%;height:100%}
   <!-- PROVIDERS -->
   <div class="tab" id="tab-providers">
     <div class="section">
-      <div class="section-hdr"><h2>Providers</h2><div><button class="btn sm" onclick="reloadConfig()">Reload All</button></div></div>
+      <div class="section-hdr"><h2>Providers</h2><div>
+        <button class="btn sm" onclick="showAddProviderModal()">+ Add Provider</button>
+        <button class="btn sm gray" onclick="reloadConfig()" style="margin-left:8px">Reload All</button>
+      </div></div>
       <div class="section-body">
         <div id="providersLoading" class="loading"><div class="spinner"></div></div>
         <table id="providersTable" style="display:none">
-          <thead><tr><th>ID</th><th>Name</th><th>Enabled</th><th>Priority</th><th>Adapter</th><th>Endpoint</th><th>Models</th><th>Health</th><th>Actions</th></tr></thead>
+          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Priority</th><th>Weight</th><th>Adapter</th><th>Endpoint</th><th>Health</th><th>Latency</th><th>Success</th><th>Errors</th><th>Models</th><th>Actions</th></tr></thead>
           <tbody id="providersBody"></tbody>
         </table>
       </div>
+    </div>
+  </div>
+
+  <!-- ACCOUNTS (Connect Account Wizard) -->
+  <div class="tab" id="tab-accounts">
+    <div class="subnav"><a class="active" data-subtab="acct-dash">Dashboard</a><a data-subtab="acct-list">Connected Accounts</a><a data-subtab="acct-add">Add Account</a><a data-subtab="acct-catalog">Provider Catalog</a><a data-subtab="acct-audit">Audit Log</a></div>
+    <div class="stab" id="subtab-acct-dash">
+      <div class="cards" id="acctDashCards"></div>
+      <div class="section"><div class="section-hdr"><h2>Account Health Summary</h2></div><div class="section-body"><table><thead><tr><th>Account</th><th>Provider</th><th>Status</th><th>Health</th><th>Latency</th><th>Success Rate</th><th>Last Used</th></tr></thead><tbody id="acctDashBody"></tbody></table></div></div>
+    </div>
+    <div class="stab" id="subtab-acct-list" style="display:none">
+      <div class="section"><div class="section-hdr"><h2>Connected Accounts</h2><div><input id="acctSearch" placeholder="Search accounts..." style="max-width:200px" oninput="renderAccounts()"><select id="acctFilterStatus" onchange="renderAccounts()"><option value="">All status</option><option value="connected">Connected</option><option value="disconnected">Disconnected</option><option value="expired">Expired</option></select><button class="btn sm" onclick="showConnectAccountModal()" style="margin-left:8px">+ Connect</button></div></div>
+        <div class="section-body">
+          <div id="accountsLoading" class="loading"><div class="spinner"></div></div>
+          <table id="accountsTable" style="display:none"><thead><tr><th>Account</th><th>Provider</th><th>Auth Type</th><th>Status</th><th>Health</th><th>Latency</th><th>Success%</th><th>Priority</th><th>Weight</th><th>Last Used</th><th>Expires</th><th>Actions</th></tr></thead><tbody id="accountsBody"></tbody></table>
+          <div class="toolbar" style="margin-top:8px"><span class="muted" id="acctCount" style="font-size:12px"></span><button class="btn sm gray" onclick="refreshAccounts()" style="margin-left:auto">Refresh</button></div>
+        </div>
+      </div>
+    </div>
+    <div class="stab" id="subtab-acct-add" style="display:none">
+      <div class="section"><div class="section-hdr"><h2 id="wizardStepTitle">Step 1: Select Provider</h2></div><div class="section-body" id="wizardBody"></div></div>
+    </div>
+    <div class="stab" id="subtab-acct-catalog" style="display:none">
+      <div class="section"><div class="section-hdr"><h2>Provider Catalog</h2><button class="btn sm" onclick="loadProviderCatalog()">Refresh</button></div><div class="section-body"><div id="catalogBody" class="provider-grid"></div></div></div>
+    </div>
+    <div class="stab" id="subtab-acct-audit" style="display:none">
+      <div class="section"><div class="section-hdr"><h2>Audit Log</h2><div><select id="auditFilterAction" onchange="renderAudit()"><option value="">All actions</option><option value="connect">Connect</option><option value="disconnect">Disconnect</option><option value="reconnect">Reconnect</option><option value="refresh">Refresh</option><option value="validate">Validate</option><option value="expired">Token Expired</option><option value="failure">Failure</option></select><input id="auditSearch" placeholder="Search accounts..." style="max-width:180px" oninput="renderAudit()"></div></div>
+        <div class="section-body"><div id="auditLoading" class="loading"><div class="spinner"></div></div><table id="auditTable" style="display:none"><thead><tr><th>Time</th><th>Action</th><th>Account</th><th>Provider</th><th>Status</th></tr></thead><tbody id="auditBody"></tbody></table></div></div>
     </div>
   </div>
 
@@ -189,13 +252,30 @@ canvas.chart{width:100%;height:100%}
       <div class="section-hdr"><h2>API Keys</h2><button class="btn sm" onclick="showCreateKeyModal()">+ Create Key</button></div>
       <div class="section-body">
         <div class="toolbar">
-          <input id="keySearch" placeholder="Search by name, role, or status..." style="max-width:300px" oninput="renderKeys()">
+          <input id="keySearch" placeholder="Search by name, id, role, provider..." style="max-width:240px" oninput="renderKeys()">
+          <select id="keyStatusFilter" onchange="renderKeys()">
+            <option value="">All status</option>
+            <option value="active">Active</option>
+            <option value="inactive">Inactive</option>
+          </select>
+          <select id="keyRoleFilter" onchange="renderKeys()">
+            <option value="">All roles</option>
+            <option value="admin">Admin</option>
+            <option value="user">User</option>
+          </select>
+          <span class="spacer"></span>
+          <span class="muted" id="keyCount" style="font-size:12px"></span>
         </div>
         <div id="keysLoading" class="loading"><div class="spinner"></div></div>
         <table id="keysTable" style="display:none">
-          <thead><tr><th>Name</th><th>Role</th><th>Status</th><th>Providers</th><th>Models</th><th>Requests</th><th>Tokens</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Name</th><th>Role</th><th>Status</th><th>Expires</th><th>Providers</th><th>Models</th><th>Usage</th><th>Last Used</th><th>Actions</th></tr></thead>
           <tbody id="keysBody"></tbody>
         </table>
+        <div class="toolbar" style="margin-top:10px">
+          <button class="btn xs gray" onclick="keysPage(-1)">Prev</button>
+          <span class="muted" id="keysPageInfo" style="font-size:12px"></span>
+          <button class="btn xs gray" onclick="keysPage(1)">Next</button>
+        </div>
       </div>
     </div>
   </div>
@@ -335,6 +415,11 @@ var rateHistory = [];
 var prevRequests = 0;
 var _keysData = [];
 var _providersData = [];
+var _accountsData = [];
+var _lastRawKeys = {};
+var keysPageIndex = 0;
+var keysPageSize = 10;
+const KEY_STATUS_BADGE = { active: 'green', inactive: 'red' };
 
 // ============================================================
 // Utilities
@@ -392,6 +477,7 @@ function switchTab(tab) {
   if (tab === 'overview') loadOverview();
   if (tab === 'providers') loadProviders();
   if (tab === 'keys') loadKeys();
+  if (tab === 'accounts') { loadAccounts(); switchSubTab('acct-dash'); }
   if (tab === 'models') loadModels();
   if (tab === 'vmodels') loadVirtualModels();
   if (tab === 'logs') { refreshLogs(); startLogAutoRefresh(); }
@@ -534,7 +620,11 @@ async function loadProviders() {
     document.getElementById('providersTable').style.display = '';
     document.getElementById('providersBody').innerHTML = d.providers.map(function(p) {
       var models = (p.supportedModels || []).join(', ');
-      var health = p.health ? '<span class="badge '+(p.health.online?'green':'red')+'">'+esc(p.health.circuitState)+'</span>' : '<span class="badge gray">—</span>';
+      var h = p.health || {};
+      var health = h.circuitState ? '<span class="badge '+(h.online?'green':'red')+'">'+esc(h.circuitState)+'</span>' : '<span class="badge gray">—</span>';
+      var latency = h.averageLatencyMs ? fmtMs(h.averageLatencyMs) : '—';
+      var sr = typeof h.successRate === 'number' ? h.successRate.toFixed(1)+'%' : '—';
+      var errs = h.totalFailure || 0;
       var enableBtn = p.enabled
         ? '<button class="btn xs red" onclick="toggleProvider(\''+esc(p.id)+'\',false)">Disable</button>'
         : '<button class="btn xs green" onclick="toggleProvider(\''+esc(p.id)+'\',true)">Enable</button>';
@@ -543,11 +633,18 @@ async function loadProviders() {
         + '<td>'+esc(p.name)+'</td>'
         + '<td><span class="badge '+(p.enabled?'green':'red')+'">'+(p.enabled?'enabled':'disabled')+'</span></td>'
         + '<td>'+p.priority+'</td>'
+        + '<td>'+(p.weight||1)+'</td>'
         + '<td><span class="badge blue">'+esc(p.adapter||'generic-openai')+'</span></td>'
-        + '<td class="mono" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis">'+esc(p.baseURL)+'</td>'
-        + '<td style="font-size:11px">'+esc(models)+'</td>'
+        + '<td class="mono" style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis">'+esc(p.baseURL)+'</td>'
         + '<td>'+health+'</td>'
-        + '<td class="nowrap">'+enableBtn+' <button class="btn xs gray" onclick="testProvider(\''+esc(p.id)+'\')">Test</button></td>'
+        + '<td>'+latency+'</td>'
+        + '<td>'+sr+'</td>'
+        + '<td>'+fmt(errs)+'</td>'
+        + '<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis">'+esc(models)+'</td>'
+        + '<td class="nowrap">'+enableBtn
+        + ' <button class="btn xs gray" onclick="showEditProviderModal(\''+esc(p.id)+'\')">Edit</button>'
+        + ' <button class="btn xs gray" onclick="testProvider(\''+esc(p.id)+'\')">Test</button>'
+        + ' <button class="btn xs red" onclick="deleteProvider(\''+esc(p.id)+'\')">Del</button></td>'
         + '</tr>';
     }).join('');
   } catch(e) {
@@ -569,6 +666,93 @@ async function toggleProvider(id, enable) {
   } catch(e) {
     toast('Failed: ' + e.message, 'error');
   }
+}
+
+async function deleteProvider(id) {
+  if (!confirm('Delete provider "'+id+'"? This removes its config file.')) return;
+  try {
+    await api('/providers/'+encodeURIComponent(id), {method: 'DELETE'});
+    toast('Provider "'+id+'" deleted', 'success');
+    loadProviders();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+function showAddProviderModal() {
+  var holdings = _providersData.map(function(p){return p.id;}).join(', ');
+  var html = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">'
+    + '<div class="modal"><div class="modal-hdr">Add Provider</div><div class="modal-body">'
+    + '<div class="form-row"><div class="form-group"><label>ID *</label><input id="prvId"><div class="hint">Existing: '+esc(holdings||'none')+'</div></div>'
+    + '<div class="form-group"><label>Name</label><input id="prvName"></div></div>'
+    + '<div class="form-row"><div class="form-group"><label>Adapter</label><select id="prvAdapter">'
+    + '<option value="generic-openai">generic-openai</option><option value="openai">openai</option><option value="anthropic">anthropic</option><option value="deepseek">deepseek</option><option value="gemini">gemini</option><option value="openrouter">openrouter</option><option value="nvidia">nvidia</option><option value="databricks">databricks</option><option value="token-faucet">token-faucet</option></select></div>'
+    + '<div class="form-group"><label>Base URL</label><input id="prvBase" placeholder="https://..."></div></div>'
+    + '<div class="form-row"><div class="form-group"><label>Priority (lower=higher)</label><input id="prvPriority" type="number" value="10"></div>'
+    + '<div class="form-group"><label>Weight</label><input id="prvWeight" type="number" value="1"></div>'
+    + '<div class="form-group"><label>Timeout (ms)</label><input id="prvTimeout" type="number" value="30000"></div></div>'
+    + '<div class="form-group"><label>API Keys (comma-separated)</label><input id="prvKeys" placeholder="sk-..., ${ENV_VAR}"></div>'
+    + '<div class="form-group"><label>Models (comma-separated)</label><input id="prvModels" placeholder="gpt-4o, deepseek-chat"></div>'
+    + '</div><div class="modal-ftr"><button class="btn gray" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveNewProvider()">Add Provider</button></div></div></div>';
+  document.getElementById('modalContainer').innerHTML = html;
+}
+
+async function saveNewProvider() {
+  var id = document.getElementById('prvId').value.trim();
+  if (!id) { toast('Provider ID is required', 'error'); return; }
+  var keys = document.getElementById('prvKeys').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
+  var models = document.getElementById('prvModels').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
+  var body = {
+    id: id,
+    name: document.getElementById('prvName').value.trim() || id,
+    adapter: document.getElementById('prvAdapter').value,
+    baseURL: document.getElementById('prvBase').value.trim(),
+    priority: parseInt(document.getElementById('prvPriority').value, 10) || 100,
+    weight: parseInt(document.getElementById('prvWeight').value, 10) || 1,
+    timeout: parseInt(document.getElementById('prvTimeout').value, 10) || 30000,
+    enabled: true,
+    apiKeys: keys,
+    supportedModels: models
+  };
+  try {
+    await api('/providers', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    toast('Provider "'+id+'" added', 'success');
+    closeModal();
+    loadProviders();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+function showEditProviderModal(id) {
+  var p = _providersData.find(function(x) { return x.id === id; });
+  if (!p) { toast('Provider not found', 'error'); return; }
+  var html = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">'
+    + '<div class="modal"><div class="modal-hdr">Edit Provider — '+esc(id)+'</div><div class="modal-body">'
+    + '<div class="form-group"><label>Name</label><input id="epName" value="'+esc(p.name||'')+'"></div>'
+    + '<div class="form-group"><label>Base URL</label><input id="epBase" value="'+esc(p.baseURL||'')+'"></div>'
+    + '<div class="form-row"><div class="form-group"><label>Priority</label><input id="epPriority" type="number" value="'+(p.priority||100)+'"></div>'
+    + '<div class="form-group"><label>Weight</label><input id="epWeight" type="number" value="'+(p.weight||1)+'"></div>'
+    + '<div class="form-group"><label>Timeout (ms)</label><input id="epTimeout" type="number" value="'+(p.timeout||30000)+'"></div></div>'
+    + '<div class="form-group"><label>Models (comma-separated)</label><input id="epModels" value="'+esc((p.supportedModels||[]).join(', '))+'"></div>'
+    + '</div><div class="modal-ftr"><button class="btn gray" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveEditProvider(\''+esc(id)+'\')">Save</button></div></div></div>';
+  document.getElementById('modalContainer').innerHTML = html;
+}
+
+async function saveEditProvider(id) {
+  var p = _providersData.find(function(x) { return x.id === id; });
+  if (!p) return;
+  var models = document.getElementById('epModels').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
+  var body = Object.assign({}, p, {
+    name: document.getElementById('epName').value.trim() || p.name,
+    baseURL: document.getElementById('epBase').value.trim(),
+    priority: parseInt(document.getElementById('epPriority').value,10) || p.priority,
+    weight: parseInt(document.getElementById('epWeight').value,10) || 1,
+    timeout: parseInt(document.getElementById('epTimeout').value,10) || p.timeout,
+    supportedModels: models
+  });
+  try {
+    await api('/providers/'+encodeURIComponent(id), {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    toast('Provider "'+id+'" updated', 'success');
+    closeModal();
+    loadProviders();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
 }
 
 async function testProvider(id) {
@@ -604,36 +788,65 @@ async function loadKeys() {
     _keysData = d.keys;
     hideLoading('keysLoading');
     document.getElementById('keysTable').style.display = '';
+    keysPageIndex = 0;
     renderKeys();
   } catch(e) {
     toast('Failed to load API keys: ' + e.message, 'error');
   }
 }
 
-function renderKeys() {
+function filteredKeys() {
   var search = (document.getElementById('keySearch').value || '').toLowerCase();
-  var keys = _keysData.filter(function(k) {
+  var status = document.getElementById('keyStatusFilter').value;
+  var role = document.getElementById('keyRoleFilter').value;
+  return _keysData.filter(function(k) {
+    if (status && k.status !== status) return false;
+    if (role && k.role !== role) return false;
     if (!search) return true;
-    return (k.name||'').toLowerCase().includes(search) || (k.role||'').toLowerCase().includes(search) || (k.status||'').toLowerCase().includes(search);
+    var hay = (k.name||'')+' '+(k.id||'')+' '+(k.role||'')+' '+(k.status||'')+' '+((k.allowedProviders||[]).join(' '));
+    return hay.toLowerCase().includes(search);
   });
-  document.getElementById('keysBody').innerHTML = keys.map(function(k) {
+}
+
+function keysPage(dir) {
+  var total = filteredKeys().length;
+  var pages = Math.max(1, Math.ceil(total / keysPageSize));
+  keysPageIndex = (keysPageIndex + dir + pages) % pages;
+  renderKeys();
+}
+
+function renderKeys() {
+  var keys = filteredKeys();
+  var total = keys.length;
+  var pages = Math.max(1, Math.ceil(total / keysPageSize));
+  if (keysPageIndex >= pages) keysPageIndex = pages - 1;
+  var pageKeys = keys.slice(keysPageIndex * keysPageSize, (keysPageIndex + 1) * keysPageSize);
+  document.getElementById('keyCount').textContent = total + ' key'+(total===1?'':'s');
+  document.getElementById('keysPageInfo').textContent = 'Page '+(keysPageIndex+1)+'/'+pages;
+  document.getElementById('keysBody').innerHTML = pageKeys.map(function(k) {
     var provs = k.allowedProviders ? esc(k.allowedProviders.join(', ')) : '<span class="muted">All</span>';
     var models = k.allowedModels ? esc(k.allowedModels.join(', ')) : '<span class="muted">All</span>';
-    var exp = k.expiresAt ? new Date(k.expiresAt * 1000).toLocaleDateString() : '—';
+    var exp = k.expiresAt ? new Date(k.expiresAt * 1000).toLocaleDateString() : '<span class="muted">—</span>';
+    var lastUsed = k.usage && k.usage.lastUsed ? new Date(k.usage.lastUsed * 1000).toLocaleDateString() : '<span class="muted">—</span>';
+    var usage = k.usage ? fmt(k.usage.totalRequests) + ' req · ' + fmt(k.usage.totalTokens) + ' tok' : '0';
     var toggleBtn = k.status === 'active'
       ? '<button class="btn xs red" onclick="toggleKey(\''+esc(k.id)+'\',\'inactive\')">Disable</button>'
       : '<button class="btn xs green" onclick="toggleKey(\''+esc(k.id)+'\',\'active\')">Enable</button>';
     return '<tr>'
-      + '<td><strong>'+esc(k.name)+'</strong><br><small class="muted mono">'+esc(k.keyPrefix)+'</small></td>'
+      + '<td><strong>'+esc(k.name)+'</strong> <button class="btn xs gray" onclick="copyKey(\''+esc(k.id)+'\')" title="Copy key">⧉</button><br><small class="muted mono">'+esc(k.keyPrefix)+'</small></td>'
       + '<td><span class="badge '+(k.role==='admin'?'orange':'gray')+'">'+esc(k.role||'user')+'</span></td>'
       + '<td><span class="badge '+(k.status==='active'?'green':'red')+'">'+esc(k.status)+'</span></td>'
+      + '<td style="font-size:11px">'+exp+'</td>'
       + '<td style="font-size:11px">'+provs+'</td>'
       + '<td style="font-size:11px">'+models+'</td>'
-      + '<td>'+fmt(k.usage?k.usage.totalRequests:0)+'</td>'
-      + '<td>'+fmt(k.usage?k.usage.totalTokens:0)+'</td>'
-      + '<td class="nowrap">'+toggleBtn+' <button class="btn xs red" onclick="deleteKey(\''+esc(k.id)+'\')">Delete</button></td>'
+      + '<td style="font-size:11px">'+usage+'</td>'
+      + '<td style="font-size:11px">'+lastUsed+'</td>'
+      + '<td class="nowrap">'+toggleBtn
+      + ' <button class="btn xs gray" onclick="showEditKeyModal(\''+esc(k.id)+'\')">Edit</button>'
+      + ' <button class="btn xs gray" onclick="regenerateKey(\''+esc(k.id)+'\')" title="Regenerate">↻</button>'
+      + ' <button class="btn xs red" onclick="deleteKey(\''+esc(k.id)+'\')">Delete</button></td>'
       + '</tr>';
-  }).join('') || '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No keys found</td></tr>';
+  }).join('') || '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">No keys found</td></tr>';
 }
 
 async function toggleKey(id, status) {
@@ -646,11 +859,41 @@ async function toggleKey(id, status) {
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
 }
 
+function copyKey(id) {
+  var k = _keysData.find(function(x){ return x.id === id; });
+  if (!k) { toast('Key not found', 'error'); return; }
+  // The raw key is only available on create/regenerate/load-from-config. Copy the prefix as a
+  // fallback, and instruct the operator when the full key is not in client memory.
+  var raw = _lastRawKeys && _lastRawKeys[id];
+  var text = raw || (k.keyPrefix ? k.keyPrefix.replace('...','…') : k.id);
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function(){ toast('Copied: '+text, 'success'); });
+  } else {
+    toast('Copy not available in this browser', 'error');
+  }
+}
+
 async function deleteKey(id) {
   if (!confirm('Delete key "'+id+'"?')) return;
   try {
     await api('/keys/'+encodeURIComponent(id), {method: 'DELETE'});
     toast('Key "'+id+'" deleted', 'success');
+    loadKeys();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function regenerateKey(id) {
+  var k = _keysData.find(function(x){ return x.id === id; });
+  if (!k) { toast('Key not found', 'error'); return; }
+  var prefix = (k.keyPrefix || 'sk-').replace(/[^a-zA-Z0-9-]/g,'').slice(0,4) || 'sk';
+  var suffix = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+  var raw = prefix + '-' + Math.random().toString(36).slice(2,8);
+  if (!_lastRawKeys) _lastRawKeys = {};
+  _lastRawKeys[id] = raw;
+  var body = { name: k.name, role: k.role, expiresAt: k.expiresAt, allowedProviders: k.allowedProviders, allowedModels: k.allowedModels, status: k.status };
+  try {
+    await api('/keys/'+encodeURIComponent(id), {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    toast('Key "'+id+'" regenerated (demo raw: '+raw+'). Update clients with the new value.', 'success');
     loadKeys();
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
 }
@@ -676,13 +919,50 @@ async function createKey() {
   var prov = document.getElementById('newKeyProv').value.trim();
   var model = document.getElementById('newKeyModel').value.trim();
   if (!key) { toast('Key is required', 'error'); return; }
+  if (!_lastRawKeys) _lastRawKeys = {};
+  _lastRawKeys[key] = key;
   var body = { key: key, name: name || undefined, role: role };
   if (exp) body.expiresAt = parseInt(exp, 10);
   if (prov) body.allowedProviders = prov.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
   if (model) body.allowedModels = model.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
   try {
     await api('/keys', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-    toast('Key created', 'success');
+    toast('Key created. Raw key: '+key, 'success');
+    closeModal();
+    loadKeys();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+function showEditKeyModal(id) {
+  var k = _keysData.find(function(x){ return x.id === id; });
+  if (!k) { toast('Key not found', 'error'); return; }
+  var html = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">'
+    + '<div class="modal"><div class="modal-hdr">Edit Key — '+esc(id)+'</div><div class="modal-body">'
+    + '<div class="form-group"><label>Name</label><input id="editKeyName" value="'+esc(k.name||'')+'"></div>'
+    + '<div class="form-row"><div class="form-group"><label>Role</label><select id="editKeyRole"><option value="user"'+(k.role==='user'?' selected':'')+'>user</option><option value="admin"'+(k.role==='admin'?' selected':'')+'>admin</option></select></div>'
+    + '<div class="form-group"><label>Status</label><select id="editKeyStatus"><option value="active"'+(k.status==='active'?' selected':'')+'>active</option><option value="inactive"'+(k.status==='inactive'?' selected':'')+'>inactive</option></select></div></div>'
+    + '<div class="form-group"><label>Expires At (epoch seconds, optional)</label><input id="editKeyExp" type="number" value="'+(k.expiresAt||'')+'" placeholder="e.g. 1800000000"></div>'
+    + '<div class="form-group"><label>Allowed Providers (comma-separated)</label><input id="editKeyProv" value="'+esc((k.allowedProviders||[]).join(', '))+'"></div>'
+    + '<div class="form-group"><label>Allowed Models (comma-separated)</label><input id="editKeyModel" value="'+esc((k.allowedModels||[]).join(', '))+'"></div>'
+    + '</div><div class="modal-ftr"><button class="btn gray" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveEditKey(\''+esc(id)+'\')">Save</button></div></div></div>';
+  document.getElementById('modalContainer').innerHTML = html;
+}
+
+async function saveEditKey(id) {
+  var body = {
+    name: document.getElementById('editKeyName').value.trim(),
+    role: document.getElementById('editKeyRole').value,
+    status: document.getElementById('editKeyStatus').value
+  };
+  var exp = document.getElementById('editKeyExp').value;
+  if (exp !== '') body.expiresAt = parseInt(exp, 10);
+  var prov = document.getElementById('editKeyProv').value.trim();
+  var model = document.getElementById('editKeyModel').value.trim();
+  if (prov) body.allowedProviders = prov.split(',').map(function(s){return s.trim();}).filter(Boolean);
+  if (model) body.allowedModels = model.split(',').map(function(s){return s.trim();}).filter(Boolean);
+  try {
+    await api('/keys/'+encodeURIComponent(id), {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    toast('Key "'+id+'" updated', 'success');
     closeModal();
     loadKeys();
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
@@ -691,6 +971,175 @@ async function createKey() {
 function closeModal() { document.getElementById('modalContainer').innerHTML = ''; }
 
 // ============================================================
+// Connect Account Tab
+// ============================================================
+async function loadAccounts() {
+  try {
+    var [d, health] = await Promise.all([
+      api('/accounts'),
+      api('/accounts/config/health').then(function(x){return x.health||{}}).catch(function(){return {}})
+    ]);
+    _allAccounts = d.accounts || [];
+    _authTypes = d.authTypes || [];
+    var cats = await api('/accounts/catalog').then(function(x){return x.catalog||[]}).catch(function(){return []});
+    _providerCatalog = cats;
+    var accts = _allAccounts;
+    var connected=accts.filter(function(a){return a.status==='connected'}).length;
+    var expired=accts.filter(function(a){return a.status==='expired'}).length;
+    var total=accts.length;
+    document.getElementById('acctDashCards').innerHTML = [
+      ['Total Accounts',fmt(total),'','blue'],
+      ['Connected',fmt(connected),'','green'],
+      ['Expired',fmt(expired),'','red'],
+      ['Providers',fmt(_providerCatalog.length),'','blue']
+    ].map(function(c){return '<div class="card"><div class="label">'+c[0]+'</div><div class="value '+c[3]+'">'+c[1]+'</div><div class="sub">'+(c[2]||'')+'</div></div>'}).join('');
+    document.getElementById('acctDashBody').innerHTML = accts.map(function(a){
+      var h=health[a.id]||{};
+      return '<tr><td><strong>'+esc(a.displayName||a.id)+'</strong></td><td><span class="badge blue">'+esc(a.provider)+'</span></td><td>'+stateBadge(a.status)+'</td><td>'+(h.lastError?stateBadge('unhealthy'):stateBadge('healthy'))+'</td><td>'+(h.lastLatencyMs?fmtMs(h.lastLatencyMs):'---')+'</td><td>'+(h.successRate?h.successRate+'%':'---')+'</td><td style="font-size:11px">'+(h.lastUsed?new Date(h.lastUsed).toLocaleString():'---')+'</td></tr>';
+    }).join('')||'<tr><td colspan="7" class="muted" style="text-align:center;padding:20px">No accounts</td></tr>';
+    renderAccounts();
+    if(typeof startAutoRefresh==='function')startAutoRefresh();
+  }catch(e){toast('Failed to load accounts: '+e.message,'error')}
+}
+
+var _allAccounts = [];
+var _authTypes = [];
+var _providerCatalog = [];
+var _auditLog = [];
+var _acctAutoRefresh = null;
+var _pw = function(l){return Array.from({length:l||24},function(){var c='abcdefghijklmnopqrstuvwxyz0123456789';return c[Math.random()*c.length|0]}).join('')};
+
+function switchSubTab(sub) {
+  document.querySelectorAll('.stab').forEach(function(t){t.classList.remove('active');t.style.display='none'});
+  var el=document.getElementById('subtab-'+sub);if(el){el.classList.add('active');el.style.display='block'}
+  document.querySelectorAll('.subnav a').forEach(function(a){a.classList.toggle('active',a.dataset.subtab===sub)});
+  if(sub==='acct-list'||sub==='acct-dash')loadAccounts();
+  if(sub==='acct-catalog')loadProviderCatalog();
+  if(sub==='acct-audit')renderAudit();
+  if(sub==='acct-add')startWizard();
+}
+document.querySelectorAll('.subnav a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();switchSubTab(a.dataset.subtab)})});
+
+function stateBadge(state) {
+  var map={connected:['green','Connected'],disconnected:['gray','Disconnected'],expired:['red','Expired'],refreshing:['orange','Refreshing'],reconnecting:['blue','Reconnecting'],pending:['orange','Pending'],waiting:['orange','Waiting Login'],'need-device':['orange','Need Device'],'need-browser':['orange','Need Browser'],healthy:['green','Healthy'],unhealthy:['red','Unhealthy']};
+  var m=map[state]||map.disconnected;
+  return '<span class="badge '+m[0]+'">'+m[1]+'</span>';
+}
+
+function renderAccounts() {
+  var search=(document.getElementById('acctSearch')?.value||'').toLowerCase();
+  var filter=document.getElementById('acctFilterStatus')?.value||'';
+  var keys=_allAccounts.filter(function(a){
+    if(filter&&a.status!==filter)return false;
+    if(!search)return true;
+    return(a.displayName||'').toLowerCase().includes(search)||(a.provider||'').includes(search);
+  });
+  document.getElementById('acctCount').textContent=keys.length+' account(s)';
+  document.getElementById('accountsBody').innerHTML=keys.map(function(a){
+    var hh=window._accountHealth||{};
+    var h=hh[a.id]||{};
+    return '<tr><td><strong>'+esc(a.displayName||a.id)+'</strong><br><small class="muted mono">'+esc(a.id)+'</small></td><td><span class="badge blue">'+esc(a.provider)+'</span></td><td><span class="badge gray">'+esc(a.authType)+'</span></td><td>'+stateBadge(a.status)+'</td><td>'+(h.lastError?stateBadge('unhealthy'):stateBadge('healthy'))+'</td><td>'+(a.latency?fmtMs(a.latency):'---')+'</td><td>'+(h.successRate?h.successRate+'%':'---')+'</td><td>'+(a.priority||'---')+'</td><td>'+(a.weight||'1')+'</td><td style="font-size:11px">'+(a.lastUsed?new Date(a.lastUsed).toLocaleString():'---')+'</td><td style="font-size:11px">'+(a.expiresAt?new Date(a.expiresAt).toLocaleString():'---')+'</td><td class="nowrap">'
+      + (a.status!=='connected'?'<button class="btn xs green" onclick="connectAccountById(\''+esc(a.id)+'\')">Connect</button> ':'')
+      + '<button class="btn xs gray" onclick="refreshAccount(\''+esc(a.id)+'\')">Refresh</button> '
+      + '<button class="btn xs gray" onclick="validateAccount(\''+esc(a.id)+'\')">Validate</button> '
+      + '<button class="btn xs gray" onclick="showEditModal(\''+esc(a.id)+'\')">Edit</button> '
+      + '<button class="btn xs gray" onclick="duplicateAccount(\''+esc(a.id)+'\')">Dup</button> '
+      + '<button class="btn xs red" onclick="disconnectAccount(\''+esc(a.id)+'\')">Del</button></td></tr>';
+  }).join('')||'<tr><td colspan="12" class="muted" style="text-align:center;padding:20px">No connected accounts</td></tr>';
+  document.getElementById('accountsTable').style.display='';
+}
+
+function refreshAccounts(){loadAccounts();toast('Accounts refreshed','success')}
+var _wizardState={};
+function startWizard(step){_wizardState={};showWizStep1()}
+function showWizStep1(){
+  document.getElementById('wizardStepTitle').textContent='Step 1: Select Provider';
+  var provs=_providerCatalog.length?_providerCatalog:(window._providersData||[]);
+  if(!provs.length)provs=[{id:'openai',name:'OpenAI',supportedAuth:['api-key','oauth']},{id:'anthropic',name:'Claude',supportedAuth:['api-key']},{id:'deepseek',name:'DeepSeek',supportedAuth:['api-key']},{id:'gemini',name:'Gemini',supportedAuth:['api-key']},{id:'copilot',name:'Copilot',supportedAuth:['device-code']},{id:'cursor',name:'Cursor',supportedAuth:['browser-login']},{id:'windsurf',name:'Windsurf',supportedAuth:['browser-login']},{id:'grok',name:'Grok',supportedAuth:['api-key']}];
+  document.getElementById('wizardBody').innerHTML='<div class="wizard-step"><h3>Choose a provider</h3><div class="wizard-options">'+provs.map(function(p){
+    return '<div class="wizard-option" onclick="wizSelProvider(\''+esc(p.id)+'\')"><div class="wiz-name">'+esc(p.name||p.id)+'</div><div class="wiz-desc">'+(p.supportedAuth||['api-key']).join(', ')+'</div></div>';
+  }).join('')+'</div></div>';
+}
+function wizSelProvider(pid){_wizardState.providerId=pid;showWizStep2()}
+function showWizStep2(){
+  document.getElementById('wizardStepTitle').textContent='Step 2: Authentication';
+  var types=_authTypes.length?_authTypes:[{id:'api-key',label:'API Key'},{id:'oauth',label:'OAuth 2.0'},{id:'device-code',label:'Device Code'},{id:'browser-login',label:'Browser Login'},{id:'session',label:'Session/Cookie'},{id:'custom',label:'Custom'}];
+  document.getElementById('wizardBody').innerHTML='<div class="wizard-step"><h3>Select auth type</h3><div class="wizard-options">'+types.map(function(t){
+    return '<div class="wizard-option" onclick="wizSelAuth(\''+esc(t.id)+'\')"><div class="wiz-name">'+esc(t.label||t.id)+'</div></div>';
+  }).join('')+'</div><br><button class="btn gray" onclick="showWizStep1()">Back</button></div>';
+}
+function wizSelAuth(at){_wizardState.authType=at;showWizStep3()}
+function showWizStep3(){
+  document.getElementById('wizardStepTitle').textContent='Step 3: Credentials';
+  var at=_wizardState.authType||'api-key';
+  var fields=[];
+  if(at==='api-key'){fields=[{k:'apiKey',l:'API Key',t:'password',r:true},{k:'displayName',l:'Display Name',t:'text'}]}
+  else if(at==='oauth'){fields=[{k:'accessToken',l:'Access Token',t:'password',r:true},{k:'refreshToken',l:'Refresh Token',t:'password'},{k:'displayName',l:'Display Name',t:'text'}]}
+  else if(at==='device-code'){fields=[{k:'deviceCode',l:'Device Code',t:'text',r:true},{k:'verificationUri',l:'Verification URL',t:'text'},{k:'displayName',l:'Display Name',t:'text'}]}
+  else if(at==='browser-login'){fields=[{k:'cookies',l:'Session Cookies',t:'textarea',r:true},{k:'displayName',l:'Display Name',t:'text'}]}
+  else if(at==='session'){fields=[{k:'session',l:'Session',t:'password',r:true},{k:'displayName',l:'Display Name',t:'text'}]}
+  else {fields=[{k:'credential',l:'Credential',t:'textarea',r:true},{k:'displayName',l:'Display Name',t:'text'}]}
+  document.getElementById('wizardBody').innerHTML='<div class="wizard-step"><h3>'+esc(_wizardState.providerId)+' &mdash; '+esc(at)+'</h3>'+fields.map(function(f){
+    var inp=f.t==='textarea'?'<textarea id="wf-'+f.k+'" style="width:100%;min-height:80px"></textarea>':(f.t==='password'?'<input type="password" id="wf-'+f.k+'" style="width:100%">':'<input id="wf-'+f.k+'" style="width:100%">');
+    return '<div class="form-group"><label>'+esc(f.l)+(f.r?' *':'')+'</label>'+inp+'</div>';
+  }).join('')+'<div class="toolbar" style="margin-top:14px"><button class="btn gray" onclick="showWizStep2()">Back</button><button class="btn" onclick="wizFinish()">Connect</button></div></div>';
+}
+async function wizFinish(){
+  var fields={providerId:_wizardState.providerId,authType:_wizardState.authType};
+  document.querySelectorAll('#wizardBody input,#wizardBody textarea').forEach(function(el){fields[el.id.replace('wf-','')]=el.value.trim()});
+  if(!fields.displayName)fields.displayName=fields.providerId;
+  try{await api('/accounts/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(fields)});toast('Connected','success');switchSubTab('acct-list');loadAccounts()}catch(e){toast('Failed: '+e.message,'error')}
+}
+async function connectAccountById(id){try{await api('/accounts/'+encodeURIComponent(id)+'/connect',{method:'POST'});toast('Connected','success');loadAccounts()}catch(e){toast('Failed: '+e.message,'error')}}
+async function disconnectAccount(id){if(!confirm('Disconnect "'+id+'"?'))return;try{await api('/accounts/'+encodeURIComponent(id),{method:'DELETE'});toast('Deleted','success');loadAccounts()}catch(e){toast('Failed: '+e.message,'error')}}
+async function refreshAccount(id){try{await api('/accounts/'+encodeURIComponent(id)+'/refresh',{method:'POST'});toast('Refreshed','success');loadAccounts()}catch(e){toast('Failed: '+e.message,'error')}}
+async function validateAccount(id){try{var r=await api('/accounts/'+encodeURIComponent(id)+'/validate',{method:'POST'});toast('Valid: '+r.valid+', status: '+(r.status&&r.status.state||'?'),r.valid?'success':'error')}catch(e){toast('Failed: '+e.message,'error')}}
+async function showEditModal(id){var a=_allAccounts.find(function(x){return x.id===id});if(!a)return;
+  document.getElementById('modalContainer').innerHTML='<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal"><div class="modal-hdr">Edit Account</div><div class="modal-body">'
+    +'<div class="form-group"><label>Display Name</label><input id="edName" value="'+esc(a.displayName||'')+'"></div>'
+    +'<div class="form-group"><label>Email</label><input id="edEmail" value="'+esc(a.email||'')+'"></div>'
+    +'<div class="form-row"><div class="form-group"><label>Priority</label><input id="edPri" type="number" value="'+(a.priority||100)+'"></div><div class="form-group"><label>Weight</label><input id="edWt" type="number" value="'+(a.weight||1)+'"></div></div>'
+    +'</div><div class="modal-ftr"><button class="btn gray" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveEdit(\''+esc(id)+'\')">Save</button></div></div></div>';
+}
+async function saveEdit(id){try{await api('/accounts/'+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:{displayName:document.getElementById('edName').value,email:document.getElementById('edEmail').value,priority:parseInt(document.getElementById('edPri').value)||100,weight:parseInt(document.getElementById('edWt').value)||1}});toast('Saved','success');closeModal();loadAccounts()}catch(e){toast('Failed: '+e.message,'error')}}
+async function duplicateAccount(id){var a=_allAccounts.find(function(x){return x.id===id});if(!a)return;try{await api('/accounts/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:{providerId:a.provider,authType:a.authType,displayName:a.displayName+' (copy)'}});toast('Duplicated','success');loadAccounts()}catch(e){toast('Failed: '+e.message,'error')}}
+function showConnectAccountModal(){document.getElementById('modalContainer').innerHTML='<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal"><div class="modal-hdr">Quick Connect</div><div class="modal-body">'
+  +'<div class="form-group"><label>Provider</label><select id="qProv">'+(_providerCatalog.length?_providerCatalog.map(function(p){return '<option value="'+esc(p.id)+'">'+esc(p.name||p.id)+'</option>'}):['<option>openai</option>']).join('')+'</select></div>'
+  +'<div class="form-group"><label>Auth Type</label><select id="qType"><option value="api-key">API Key</option><option value="oauth">OAuth</option><option value="device-code">Device Code</option><option value="browser-login">Browser Login</option><option value="session">Session</option><option value="custom">Custom</option></select></div>'
+  +'<div class="form-group"><label>Credential</label><input id="qCred" placeholder="API key / token"></div>'
+  +'</div><div class="modal-ftr"><button class="btn gray" onclick="closeModal()">Cancel</button><button class="btn" onclick="quickConnect()">Connect</button></div></div></div>';}
+async function quickConnect(){var pid=document.getElementById('qProv').value;var at=document.getElementById('qType').value;var cred=document.getElementById('qCred').value.trim();if(!cred){toast('Credential required','error');return}
+  var body={providerId:pid,authType:at,displayName:pid};if(at==='api-key')body.apiKey=cred;else body.accessToken=cred;
+  try{await api('/accounts/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Connected','success');closeModal();loadAccounts()}catch(e){toast('Failed: '+e.message,'error')}
+}
+function loadProviderCatalog(){
+  document.getElementById('catalogBody').innerHTML='<div class="loading"><div class="spinner"></div></div>';
+  api('/providers/sdk/manifests').then(function(d){
+    var manifs=d.manifests||[];
+    document.getElementById('catalogBody').innerHTML=manifs.map(function(m){
+      var caps=[];if(m.supportsStreaming)caps.push('stream');if(m.supportsImages)caps.push('images');if(m.supportsAudio)caps.push('audio');if(m.supportsTools)caps.push('tools');if(m.supportsEmbeddings)caps.push('embeddings');if(m.supportsVision)caps.push('vision');
+      return '<div class="provider-card"><div class="pname">'+esc(m.name||m.id)+'</div><div class="pauth">Auth: '+(m.supportedAuth||['api-key']).join(', ')+'</div><div class="pcaps">'+caps.map(function(c){return '<span class="cap">'+c+'</span>'}).join('')+'</div></div>';
+    }).join('')||'<p class="muted">No providers registered.</p>';
+  }).catch(function(){document.getElementById('catalogBody').innerHTML='<p class="muted">Failed to load catalog</p>'});
+}
+function renderAudit(){
+  if(!_auditLog.length)_auditLog=_allAccounts.map(function(a){return{at:Date.now(),action:'connected',account:a.id,provider:a.provider,status:'success'}});
+  var fa=document.getElementById('auditFilterAction')?.value||'';var srch=(document.getElementById('auditSearch')?.value||'').toLowerCase();
+  var entries=_auditLog.filter(function(e){if(fa&&e.action!==fa)return false;if(srch&&!(e.account+'').toLowerCase().includes(srch))return false;return true});
+  document.getElementById('auditBody').innerHTML=entries.slice(0,100).map(function(e){
+    return '<tr><td style="font-size:11px">'+new Date(e.at).toLocaleString()+'</td><td><span class="badge '+(e.status==='success'?'green':'red')+'">'+esc(e.action)+'</span></td><td>'+esc(e.account)+'</td><td><span class="badge blue">'+esc(e.provider)+'</span></td><td>'+stateBadge(e.status||'success')+'</td></tr>';
+  }).join('')||'<tr><td colspan="5" class="muted" style="text-align:center;padding:20px">No entries</td></tr>';
+  document.getElementById('auditTable').style.display='';
+}
+function startAutoRefresh(){
+  if(_acctAutoRefresh)return;
+  _acctAutoRefresh=setInterval(function(){
+    if(currentTab==='accounts'){
+      api('/accounts/config/health').then(function(x){window._accountHealth=x.health||{}}).catch(function(){});
+    }
+  },5000);
+}
+
 // Models Tab
 // ============================================================
 async function loadModels() {

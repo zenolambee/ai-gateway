@@ -105,11 +105,13 @@ class QuotaTracker {
    * @param {number} [opts.dailyRequests] - max requests per day per key
    * @param {number} [opts.dailyTokens] - max tokens per day per key
    * @param {number} [opts.monthlyTokens] - max tokens per month per key
+   * @param {object} [opts.storageProvider] - optional StorageProvider for persistence
    */
   constructor(opts = {}) {
     this.dailyRequests = opts.dailyRequests || 0;
     this.dailyTokens = opts.dailyTokens || 0;
     this.monthlyTokens = opts.monthlyTokens || 0;
+    this._store = opts.storageProvider || null;
     // key -> { day, dayCount, dayTokens, month, monthTokens }
     this.data = new Map();
   }
@@ -119,6 +121,17 @@ class QuotaTracker {
       this.data.set(key, { day: 0, dayCount: 0, dayTokens: 0, month: 0, monthTokens: 0 });
     }
     return this.data.get(key);
+  }
+
+  _persist(key, entry) {
+    if (!this._store) return;
+    this._store.hset(`quota:${key}`, {
+      day: entry.day,
+      dayCount: entry.dayCount,
+      dayTokens: entry.dayTokens,
+      month: entry.month,
+      monthTokens: entry.monthTokens,
+    }).catch(() => {});
   }
 
   _rollover(entry, now) {
@@ -193,6 +206,7 @@ class QuotaTracker {
       entry.dayTokens += detail.tokens;
       entry.monthTokens += detail.tokens;
     }
+    this._persist(key, entry);
   }
 }
 
@@ -252,15 +266,23 @@ class ConcurrencyTracker {
  * response (for concurrency tracking). The executor calls `recordTokens()`
  * after a successful response to update token quotas.
  *
+ * When a storageProvider is given, the quota tracker (daily/monthly token
+ * usage) is persisted through it so counters survive restarts. The
+ * algorithmic limiters (sliding window, token bucket) remain in-memory for
+ * performance — they are fast-reset on restart, which is acceptable.
+ *
  * All state is in-memory. NO retry, NO HTTP — pure state machine.
  */
 class RateLimiter {
   /**
    * @param {object} config - output of loadRateLimitConfig()
+   * @param {object} [opts]
+   * @param {object} [opts.storageProvider] - optional StorageProvider instance
    */
-  constructor(config = {}) {
+  constructor(config = {}, opts = {}) {
     this.enabled = !!config.enabled;
     this.algorithm = config.algorithm || 'token_bucket';
+    this._store = opts.storageProvider || null;
 
     const algo = this.algorithm;
     const mkAlgo = (cfg) => {
@@ -282,6 +304,7 @@ class RateLimiter {
       dailyRequests: (config.perKey || {}).dailyRequestQuota,
       dailyTokens: (config.perKey || {}).dailyTokenQuota,
       monthlyTokens: (config.perKey || {}).monthlyTokenQuota,
+      storageProvider: this._store,
     });
 
     this.config = config;

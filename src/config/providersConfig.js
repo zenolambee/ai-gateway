@@ -7,6 +7,8 @@ const REQUIRED_FIELDS = ['id', 'name', 'baseURL', 'supportedModels'];
 
 /**
  * Expand `${VAR}` placeholders inside a string using process.env.
+ * When a placeholder cannot be resolved the original `${VAR}` token is
+ * returned so that callers can detect unexpanded variables as a post-step.
  * @param {string} value
  * @returns {string}
  */
@@ -15,6 +17,45 @@ function expandEnvVars(value) {
   return value.replace(/\$\{([^}]+)\}/g, (match, varName) => {
     return process.env[varName] !== undefined ? process.env[varName] : match;
   });
+}
+
+/**
+ * Check whether a string contains any unexpanded `${...}` placeholder
+ * tokens. Returns true when at least one unresolved variable is found.
+ * @param {*} value
+ * @returns {boolean}
+ */
+function hasUnexpandedEnvVars(value) {
+  if (typeof value === 'string') return /\$\{[^}]+\}/.test(value);
+  if (Array.isArray(value)) return value.some(hasUnexpandedEnvVars);
+  if (value && typeof value === 'object') {
+    return Object.values(value).some(hasUnexpandedEnvVars);
+  }
+  return false;
+}
+
+/**
+ * Collect all unexpanded `${...}` variable names found in a value.
+ * Returns an array of variable names (e.g. ["OPENAI_API_KEY"]).
+ * @param {*} value
+ * @returns {string[]}
+ */
+function findUnexpandedEnvVarNames(value) {
+  const names = [];
+  if (typeof value === 'string') {
+    const re = /\$\{([^}]+)\}/g;
+    let m;
+    while ((m = re.exec(value)) !== null) names.push(m[1]);
+    return names;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) names.push(...findUnexpandedEnvVarNames(v));
+    return names;
+  }
+  if (value && typeof value === 'object') {
+    for (const v of Object.values(value)) names.push(...findUnexpandedEnvVarNames(v));
+  }
+  return names;
 }
 
 /**
@@ -90,6 +131,8 @@ module.exports = {
   DEFAULT_PROVIDERS_DIR,
   validateProviderConfigs,
   validateProvider,
+  hasUnexpandedEnvVars,
+  findUnexpandedEnvVarNames,
 };
 
 /**
@@ -100,8 +143,12 @@ module.exports = {
  *   - Duplicated provider ids
  *   - Duplicated priorities (warn-level — not an error)
  *   - Invalid baseURL (must be a valid http/https URL)
- *   - Missing API keys for enabled providers
+ *   - Unexpanded env-var placeholders (${VAR} where env var is not set)
+ *   - Missing or empty API keys for enabled providers
  *   - Duplicated model ids within the same provider
+ *
+ * Providers that fail validation are NOT included in the returned `providers`
+ * list — they are dropped so the gateway can continue with the valid ones.
  *
  * @param {Array<object>} providers - raw provider configs (post-env-expand)
  * @returns {{ valid: boolean, errors: string[], warnings: string[], providers: Array<object> }}
@@ -125,7 +172,7 @@ function validateProviderConfigs(providers) {
       continue;
     }
 
-    // Per-provider validation
+    // Per-provider field validation
     const { valid: isValid, errors: providerErrors } = validateProvider(raw);
     if (!isValid) {
       errors.push(`Provider "${raw && raw.id || 'unknown'}": ${providerErrors.join('; ')}`);
@@ -162,11 +209,50 @@ function validateProviderConfigs(providers) {
       }
     }
 
-    // Missing API keys for enabled providers (warning — the provider will
-    // fail at runtime with NO_API_KEYS, but it's useful to surface early)
+    // Check for unexpanded env-var placeholders in critical fields
+    const unexpandedFields = [];
+    for (const field of ['baseURL', 'id']) {
+      if (hasUnexpandedEnvVars(raw[field])) {
+        unexpandedFields.push(field);
+      }
+    }
+    if (Array.isArray(raw.apiKeys)) {
+      for (let i = 0; i < raw.apiKeys.length; i++) {
+        const k = raw.apiKeys[i];
+        if (typeof k === 'string' && hasUnexpandedEnvVars(k)) {
+          unexpandedFields.push(`apiKeys[${i}]`);
+        } else if (k && typeof k === 'object' && typeof k.value === 'string' && hasUnexpandedEnvVars(k.value)) {
+          unexpandedFields.push(`apiKeys[${i}].value`);
+        }
+      }
+    }
+    if (unexpandedFields.length > 0) {
+      const varNames = findUnexpandedEnvVarNames(unexpandedFields.map((f) => {
+        const val = fieldByPath(raw, f);
+        return typeof val === 'string' ? val : '';
+      }));
+      const detail = varNames.length > 0
+        ? `unset environment variable(s): ${[...new Set(varNames)].join(', ')}`
+        : `unexpanded placeholder(s) in: ${unexpandedFields.join(', ')}`;
+      errors.push(`Provider "${raw.id}": ${detail}`);
+      continue;
+    }
+
+    // Missing API keys for enabled providers — disable them instead of
+    // a soft warning only. A provider with no keys will fail at runtime
+    // with NO_API_KEYS on every request, so we treat it as a hard error.
     if (raw.enabled !== false) {
-      if (!Array.isArray(raw.apiKeys) || raw.apiKeys.length === 0 || raw.apiKeys.every((k) => !k)) {
-        warnings.push(`Provider "${raw.id}" is enabled but has no API keys configured`);
+      if (!Array.isArray(raw.apiKeys) || raw.apiKeys.length === 0 || raw.apiKeys.every((k) => {
+        if (typeof k === 'string') return !k;
+        if (k && typeof k === 'object') return !k.value;
+        return true;
+      })) {
+        // Instead of dropping the provider entirely, we keep it but
+        // mark it as disabled so the startup log can report it clearly.
+        const disabled = { ...raw, enabled: false, __disabledReason: 'No API keys configured' };
+        valid.push(disabled);
+        warnings.push(`Provider "${raw.id}" has no API keys configured — provider has been disabled`);
+        continue;
       }
     }
 
@@ -186,6 +272,28 @@ function validateProviderConfigs(providers) {
   }
 
   return { valid: errors.length === 0, errors, warnings, providers: valid };
+}
+
+/**
+ * Safely retrieve a nested field value from an object by path.
+ * Supports dot-separated keys and numeric array indices:
+ *   "apiKeys[0]"  -> obj.apiKeys[0]
+ *   "config.timeout" -> obj.config.timeout
+ *   "apiKeys[0].value" -> obj.apiKeys[0].value
+ * @param {object} obj
+ * @param {string} path
+ * @returns {*}
+ */
+function fieldByPath(obj, path) {
+  // Normalize bracket notation to dot notation: apiKeys[0] -> apiKeys.0
+  const normalized = path.replace(/\[(\d+)\]/g, '.$1');
+  const parts = normalized.split('.');
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null || typeof cur !== 'object') return undefined;
+    cur = cur[p];
+  }
+  return cur;
 }
 
 /**

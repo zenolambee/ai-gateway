@@ -18,7 +18,7 @@ class GeminiAdapter extends GenericOpenAIAdapter {
       supportsResponses: false,
       supportsStreaming: true,
       supportsEmbeddings: true,
-      supportsImages: true,
+      supportsImages: false,
       supportsAudio: false,
       supportsTools: true,
       supportsReasoning: true,

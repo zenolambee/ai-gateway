@@ -77,8 +77,7 @@ class ProviderConfigManager {
    * Start watching the provider config directory for changes.
    */
   startWatching() {
-    const dir = this.providerManager._configDir
-      || process.env.PROVIDERS_CONFIG_DIR
+    const dir = this.providerManager.getConfigDir()
       || path.join(process.cwd(), 'config', 'providers');
 
     if (!fs.existsSync(dir)) {
@@ -159,8 +158,7 @@ class ProviderConfigManager {
    * @returns {Promise<{ success: boolean, errors: string[], warnings: string[] }>}
    */
   async reload() {
-    const dir = this.providerManager._configDir
-      || process.env.PROVIDERS_CONFIG_DIR
+    const dir = this.providerManager.getConfigDir()
       || path.join(process.cwd(), 'config', 'providers');
 
     logger.info('ProviderConfigManager: reloading provider configuration', { dir });
@@ -198,6 +196,19 @@ class ProviderConfigManager {
 
     return { success: true, errors: [], warnings: result.warnings };
   }
+
+  /**
+   * Run the reload cascade: reset the adapter cache, reload API keys,
+   * invalidate the model registry cache, reset the health monitor, and
+   * re-apply the routing strategy. Each step is independent — a failure
+   * in one does not block the others.
+   *
+   * This is a public method so that the admin API can trigger the cascade
+   * after a live provider edit without a full file-system reload.
+   *
+   * @param {Array<object>} providers - the new normalized provider list
+   */
+  reloadCascade(providers) { this._runReloadCascade(providers); }
 
   /**
    * Run the reload cascade: reset the adapter cache, reload API keys,

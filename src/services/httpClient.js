@@ -377,6 +377,77 @@ class HttpClient {
   }
 
   /**
+   * Low-level generic HTTP request used by auth adapters / token endpoints
+   * (OAuth authorize, token, refresh, revoke, device authorization). Unlike
+   * sendRequest(), this does NOT resolve or rotate a provider API key and does
+   * NOT report to the ApiKeyManager — it is intentionally provider-independent
+   * so OAuth clients can send basic-auth / client-credentials headers.
+   *
+   * @param {object} opts
+   * @param {string} opts.url - full request URL
+   * @param {string} [opts.method='GET']
+   * @param {object} [opts.headers]
+   * @param {object|string} [opts.body]
+   * @param {boolean} [opts.form=false] - treat body as URL-encoded form
+   * @param {number} [opts.timeout=30000]
+   * @param {boolean} [opts.raw=false] - do not normalize errors (return {status,data})
+   * @returns {Promise<{status:number, headers:object, data:*}>}
+   */
+  async request(opts = {}) {
+    const {
+      url,
+      method = 'GET',
+      headers = {},
+      body,
+      form = false,
+      timeout = 30000,
+      raw = false,
+    } = opts;
+
+    if (!url) {
+      throw new AppError('request: url is required', 400);
+    }
+
+    const reqHeaders = { Accept: 'application/json', ...headers };
+    let data;
+    if (form) {
+      reqHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
+      data = new URLSearchParams(body || {}).toString();
+    } else if (body !== undefined && body !== null) {
+      reqHeaders['Content-Type'] = reqHeaders['Content-Type'] || 'application/json';
+      data = typeof body === 'string' ? body : JSON.stringify(body);
+    }
+
+    const axiosConfig = {
+      method: method.toUpperCase(),
+      url,
+      headers: reqHeaders,
+      timeout,
+      data,
+      responseType: 'json',
+      validateStatus: () => true,
+    };
+
+    const startedAt = Date.now();
+    const res = await axios(axiosConfig);
+
+    if (raw) {
+      return { status: res.status, headers: res.headers, data: res.data };
+    }
+    if (res.status >= 400) {
+      const error = {
+        response: res,
+        config: axiosConfig,
+        message: `Request failed with status code ${res.status}`,
+      };
+      const normalized = normalizeHttpError(error, { method, url });
+      normalized.payload = res.data;
+      throw normalized;
+    }
+    return { status: res.status, headers: res.headers, data: res.data, durationMs: Date.now() - startedAt };
+  }
+
+  /**
    * Open a streaming request to a provider.
    *
    * This method is intentionally a placeholder. It returns the raw axios

@@ -23,6 +23,15 @@ const {
   discovery,
   virtualModelRegistry,
   virtualModelsConfig,
+  connectionRegistry,
+  authAdapterFactory,
+  providerCatalog,
+  providerSDKRegistry,
+  sdkHealthService,
+  sdkModelDiscovery,
+  sdkRoutingBridge,
+  accountManager,
+  connectionManager,
 } = require('../services');
 const { SELECTION_STRATEGIES, validateVirtualModelsConfig } = require('../config/virtualModelsConfig');
 
@@ -142,8 +151,8 @@ router.put('/providers/:id', (req, res, next) => {
       });
     }
 
-    // Run the reload cascade
-    providerConfigManager._runReloadCascade(result.providers);
+    // Run the reload cascade through the config manager's public API
+    providerConfigManager.reloadCascade(result.providers);
 
     res.json({ success: true, provider: updated });
   } catch (err) {
@@ -183,6 +192,38 @@ router.post('/providers/:id/test', async (req, res, next) => {
   }
 });
 
+// --- Provider Adapter SDK manifests ---
+/**
+ * GET /admin/api/providers/sdk/manifests
+ *
+ * Returns the ProviderManifest for every registered SDK provider. The
+ * dashboard uses this to auto-render provider configuration forms without
+ * hardcoding provider details. New providers registered via the SDK appear
+ * here automatically.
+ */
+router.get('/providers/sdk/manifests', (req, res) => {
+  res.json({ manifests: providerSDKRegistry ? providerSDKRegistry.listManifests() : [] });
+});
+
+// Admin endpoint: trigger manual dynamic model discovery (force refresh).
+router.post('/providers/sdk/discover', async (req, res, next) => {
+  try {
+    if (!sdkModelDiscovery) throw new AppError('SDK model discovery not available', 500, { code: 'NOT_AVAILABLE' });
+    const result = await sdkModelDiscovery.discover({ force: true });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Admin endpoint: return current SDK provider health status.
+router.get('/providers/sdk/health', (req, res) => {
+  res.json({ health: sdkHealthService ? sdkHealthService.getStatus() : {} });
+});
+
+// Admin endpoint: return the current capability map (for capability-aware routing).
+router.get('/providers/sdk/capabilities', (req, res) => {
+  res.json({ capabilities: modelRouter ? modelRouter._legacyCapabilities || {} : {} });
+});
+
 // Manual reload
 router.post('/reload', async (req, res, next) => {
   try {
@@ -206,47 +247,48 @@ router.get('/keys', (req, res) => {
   });
 });
 
-router.post('/keys', (req, res, next) => {
+router.post('/keys', async (req, res, next) => {
   try {
-    const { key, name, role, allowedProviders, allowedModels, expiresAt } = req.body;
+    const { key, name, role, allowedProviders, deniedProviders, allowedModels, deniedModels, expiresAt, description, permissions, rateLimit, quota, metadata, tags, enabled, revoked, usageCount } = req.body;
     if (!key || typeof key !== 'string') {
       throw new AppError('A "key" string is required', 400, { code: 'INVALID_REQUEST' });
     }
+    if (apiKeyStore.keysByKey.has(key)) {
+      throw new AppError('A key with this value already exists', 409, { code: 'CONFLICT' });
+    }
 
-    // Build the full key list with the new entry
-    const newEntry = {
-      id: key,
+    const record = await apiKeyStore.createKey({
       key,
       name: name || `key-${Date.now()}`,
-      status: 'active',
-      role: role === 'admin' ? 'admin' : 'user',
-      allowedProviders: Array.isArray(allowedProviders) ? allowedProviders : undefined,
-      allowedModels: Array.isArray(allowedModels) ? allowedModels : undefined,
-      expiresAt: typeof expiresAt === 'number' ? expiresAt : undefined,
-      createdAt: Math.floor(Date.now() / 1000),
-    };
+      role,
+      allowedProviders,
+      deniedProviders,
+      allowedModels,
+      deniedModels,
+      expiresAt,
+      description,
+      permissions,
+      rateLimit,
+      quota,
+      metadata,
+      tags,
+      enabled,
+      status: req.body.status,
+      usageCount,
+    });
 
-    // Add to the store
-    apiKeyStore.keys.push(newEntry);
-    apiKeyStore.keysByKey.set(newEntry.key, newEntry);
-
-    res.json({ success: true, key: apiKeyStore._publicView(newEntry) });
+    res.json({ success: true, key: apiKeyStore.publicView(record) });
   } catch (err) {
     next(err);
   }
 });
 
-router.delete('/keys/:id', (req, res, next) => {
+router.delete('/keys/:id', async (req, res, next) => {
   try {
     const id = req.params.id;
-    const idx = apiKeyStore.keys.findIndex((k) => k.id === id);
-    if (idx < 0) {
+    const removed = await apiKeyStore.deleteKey(id);
+    if (!removed) {
       throw new AppError(`Key "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
-    }
-    apiKeyStore.keys.splice(idx, 1);
-    const keyToRemove = apiKeyStore.keys.find((k) => k.id === id);
-    if (keyToRemove) {
-      apiKeyStore.keysByKey.delete(keyToRemove.key);
     }
     res.json({ success: true });
   } catch (err) {
@@ -254,22 +296,29 @@ router.delete('/keys/:id', (req, res, next) => {
   }
 });
 
-router.put('/keys/:id', (req, res, next) => {
+router.put('/keys/:id', async (req, res, next) => {
   try {
     const id = req.params.id;
-    const keyRecord = apiKeyStore.keys.find((k) => k.id === id);
-    if (!keyRecord) {
+    const updated = await apiKeyStore.updateKey(id, req.body);
+    if (!updated) {
       throw new AppError(`Key "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
     }
+    res.json({ success: true, key: apiKeyStore.publicView(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
 
-    if (req.body.status !== undefined) keyRecord.status = req.body.status;
-    if (req.body.role !== undefined) keyRecord.role = req.body.role;
-    if (req.body.expiresAt !== undefined) keyRecord.expiresAt = req.body.expiresAt;
-    if (req.body.allowedProviders !== undefined) keyRecord.allowedProviders = req.body.allowedProviders;
-    if (req.body.allowedModels !== undefined) keyRecord.allowedModels = req.body.allowedModels;
-    if (req.body.name !== undefined) keyRecord.name = req.body.name;
-
-    res.json({ success: true, key: apiKeyStore._publicView(keyRecord) });
+// PATCH — partial update (same handler as PUT for full backward compat; the
+// update method only applies provided fields).
+router.patch('/keys/:id', async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const updated = await apiKeyStore.updateKey(id, req.body);
+    if (!updated) {
+      throw new AppError(`Key "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    res.json({ success: true, key: apiKeyStore.publicView(updated) });
   } catch (err) {
     next(err);
   }
@@ -379,8 +428,7 @@ router.put('/config', async (req, res, next) => {
     }
 
     // Write each provider to its own file in the config dir
-    const dir = providerManager._configDir
-      || process.env.PROVIDERS_CONFIG_DIR
+    const dir = providerManager.getConfigDir()
       || path.join(process.cwd(), 'config', 'providers');
 
     if (!fs.existsSync(dir)) {
@@ -962,5 +1010,395 @@ router.put('/virtual-models', (req, res, next) => {
     next(err);
   }
 });
+
+// ---------------------------------------------------------------
+
+// ---------------------------------------------------------------
+// Connect Account — provider catalog + auth types
+// ---------------------------------------------------------------
+/**
+ * GET /admin/api/accounts/catalog
+ * Returns the full provider catalog (metadata + templates for every known
+ * provider) so the UI can render "Connect Account" forms.
+ */
+router.get('/accounts/catalog', (req, res) => {
+  res.json({ catalog: providerCatalog ? providerCatalog.list() : [] });
+});
+
+/**
+ * GET /admin/api/accounts/types
+ * Returns the available auth types for the Connect Account UI.
+ */
+router.get('/accounts/types', (req, res) => {
+  res.json({ authTypes: connectionRegistry.authTypes() });
+});
+
+// Connect Account (Sprint: Dashboard Admin & Connect Account)
+// ---------------------------------------------------------------
+// Endpoints for the generic authentication architecture. Each provider
+// selects an auth type; the ConnectionRegistry + AuthAdapterFactory drive the
+// lifecycle. New providers = new adapter — no public API change.
+
+/**
+ * GET /admin/api/accounts
+ * GET /admin/api/accounts?providerId=<id>
+ *
+ * List all connected accounts (redacted — never exposes credentials), plus
+ * the available auth types and per-provider adapter availability.
+/**
+
+ * GET /admin/api/accounts/:accountId/status
+ *
+ * Return the current connection state for one account.
+ */
+router.get('/accounts/:accountId/status', async (req, res, next) => {
+  try {
+    const status = await connectionRegistry.status(req.params.accountId);
+    res.json(status);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /admin/api/accounts/connect
+ *
+ * Connect (or reconnect) a provider account. Body:
+ *   { providerId, authType, name?, ...provider-specific credential }
+ */
+router.post('/accounts/connect', async (req, res, next) => {
+  try {
+    const account = await connectionRegistry.connect(req.body || {});
+    res.json({ success: true, account });
+  } catch (err) {
+    next(new AppError(err.message || 'connect failed', 400, { code: err.code || 'AUTH_CONNECT_FAILED' }));
+  }
+});
+
+/**
+ * POST /admin/api/accounts/:accountId/refresh
+ *
+ * Refresh a connection's expiring credential.
+ */
+router.post('/accounts/:accountId/refresh', async (req, res, next) => {
+  try {
+    const account = await connectionRegistry.refresh(req.params.accountId);
+    res.json({ success: true, account });
+  } catch (err) {
+    next(new AppError(err.message || 'refresh failed', 400, { code: err.code || 'AUTH_REFRESH_FAILED' }));
+  }
+});
+
+/**
+ * DELETE /admin/api/accounts/:accountId
+ *
+ * Disconnect (revoke) an account.
+ */
+router.delete('/accounts/:accountId', async (req, res, next) => {
+  try {
+    const ok = await connectionRegistry.disconnect(req.params.accountId);
+    if (!ok) {
+      throw new AppError(`Account "${req.params.accountId}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /admin/api/accounts/hydrate
+ *
+ * Manually re-restore accounts from the storage backend (e.g. after a Redis
+ * connection is established).
+ */
+router.post('/accounts/hydrate', async (req, res, next) => {
+  try {
+    const count = await connectionRegistry.hydrate();
+    res.json({ success: true, restored: count });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Account Manager: enhance accounts with rich fields, health, test, routing ---
+
+/**
+ * PUT /admin/api/accounts/:accountId
+ *
+ * Update an account's fields (displayName, email, enabled, priority, weight, tags,
+ * quota, apiKey, accessToken, refreshToken). Also can enable/disable.
+ */
+router.put('/accounts/:accountId', async (req, res, next) => {
+  try {
+    const id = req.params.accountId;
+    const status = await connectionRegistry.status(id).catch(() => null);
+    if (!status || status.state === 'disconnected') {
+      throw new AppError(`Account "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const patch = req.body || {};
+    // Merge into the existing account state (preserve credential from storage).
+    const merged = { ...status, ...patch, enabled: patch.enabled !== undefined ? patch.enabled : true };
+    await connectionRegistry._saveAccount(merged, status.authType);
+    res.json({ success: true, account: accountManager.publicView(merged) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /admin/api/accounts/:accountId
+ *
+ * Partial update alias (same handler).
+ */
+router.patch('/accounts/:accountId', async (req, res, next) => {
+  try {
+    const id = req.params.accountId;
+    const status = await connectionRegistry.status(id);
+    if (!status || status.state === 'disconnected') {
+      throw new AppError(`Account "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const patch = req.body || {};
+    const merged = { ...status, ...patch, enabled: patch.enabled !== undefined ? patch.enabled : true };
+    await connectionRegistry._saveAccount(merged, status.authType);
+    res.json({ success: true, account: accountManager.publicView(merged) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /admin/api/accounts/:accountId/test
+ *
+ * Test connection validity for an account.
+ */
+router.post('/accounts/:accountId/test', async (req, res, next) => {
+  try {
+    const id = req.params.accountId;
+    const token = await connectionRegistry.getToken ? connectionRegistry.getToken(id) : null;
+    if (!token) throw new AppError(`Account "${id}" has no token record`, 400, { code: 'AUTH_NOT_CONNECTED' });
+    const start = Date.now();
+    // Attempt a simple connectivity check (try to get the provider's models).
+    const adapter = connectionRegistry._adapter(token.providerId, token.authType);
+    let ok = true;
+    let error = null;
+    try {
+      if (adapter.healthCheckHttp) {
+        await adapter.healthCheckHttp({ timeout: 5000 });
+      } else {
+        // Lightweight check: verify the credential can be decrypted and is not expired.
+        ok = token.status !== 'expired' && !!token.accessToken;
+        if (!ok) error = 'Token is expired';
+      }
+    } catch (err) {
+      ok = false;
+      error = err.message;
+      accountManager.recordFailure(id, err.message);
+    }
+    const latencyMs = Date.now() - start;
+    res.json({ success: ok, accountId: id, latencyMs, error, state: token.status });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- ConnectionManager lifecycle endpoints ---
+
+router.post('/accounts/:id/connect', async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const existing = await connectionManager.getConnection(id);
+    if (existing) throw new AppError(`Account "${id}" already exists`, 409, { code: 'CONFLICT' });
+    const acct = await connectionManager.registerConnection({ accountId: id, ...(req.body || {}) });
+    res.status(201).json({ success: true, account: acct });
+  } catch (err) { next(err); }
+});
+
+router.post('/accounts/:id/disconnect', async (req, res, next) => {
+  try {
+    await connectionManager.disconnect(req.params.id);
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+router.post('/accounts/:id/reconnect', async (req, res, next) => {
+  try {
+    const acct = await connectionManager.reconnect(req.params.id);
+    res.json({ success: true, account: acct });
+  } catch (err) { next(err); }
+});
+
+router.post('/accounts/:id/refresh', async (req, res, next) => {
+  try {
+    const acct = await connectionManager.refresh(req.params.id);
+    res.json({ success: true, account: acct });
+  } catch (err) { next(err); }
+});
+
+router.post('/accounts/:id/validate', async (req, res, next) => {
+  try {
+    const valid = await connectionManager.validate(req.params.id);
+    const status = await connectionManager.getStatus(req.params.id);
+    res.json({ valid, status });
+  } catch (err) { next(err); }
+});
+
+/**
+ * GET /admin/api/accounts/config/health
+ *
+ * Returns per-account health metrics for the dashboard.
+ */
+router.get('/accounts/config/health', (req, res) => {
+  res.json({ health: accountManager ? accountManager.getHealth() : {} });
+});
+
+/**
+ * PUT /admin/api/accounts/config/routing
+ *
+ * Set the account selection strategy per provider. Body:
+ *   { providerId: "...", strategy: "priority|fastest|weighted|round-robin|least-used|random" }
+ */
+router.put('/accounts/config/routing', (req, res, next) => {
+  try {
+    const { providerId, strategy } = req.body || {};
+    if (!providerId || !strategy) {
+      throw new AppError('providerId and strategy are required', 400, { code: 'INVALID_REQUEST' });
+    }
+    const valid = ['priority', 'fastest', 'weighted', 'round-robin', 'least-used', 'random'];
+    if (!valid.includes(strategy)) {
+      throw new AppError(`Invalid strategy "${strategy}". Valid: ${valid.join(', ')}`, 400, { code: 'INVALID_REQUEST' });
+    }
+    // Store the strategy as a property on the AccountManager's cursor config.
+    accountManager._cursors.set(providerId, { ...(accountManager._cursors.get(providerId) || {}), strategy });
+    res.json({ success: true, providerId, strategy });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Get all available accounts with live status and health. */
+router.get('/accounts', async (req, res, next) => {
+  try {
+    const accounts = await connectionRegistry.listAccounts();
+    const providerId = req.query.providerId;
+    const filtered = providerId ? accounts.filter((a) => a.providerId === providerId) : accounts;
+    // Enhance with account manager fields (priority, weight, health, etc.)
+    const enhanced = filtered.map((a) => {
+      const pub = accountManager.publicView(a);
+      const health = (accountManager.getHealth() || {})[a.accountId] || {};
+      return { ...pub, ...health, credential: undefined };
+    });
+    res.json({
+      accounts: enhanced,
+      authTypes: connectionRegistry.authTypes(),
+      routing: Object.fromEntries(accountManager._cursors),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+/**
+ * POST /admin/api/providers
+ *
+ * Add a new provider by writing its config file and triggering a reload.
+ * Body is the full provider config object (id required).
+ */
+router.post('/providers', async (req, res, next) => {
+  try {
+    const p = req.body || {};
+    if (!p.id || typeof p.id !== 'string') {
+      throw new AppError('A provider "id" is required', 400, { code: 'INVALID_REQUEST' });
+    }
+    if (providerManager.providersById.has(p.id)) {
+      throw new AppError(`Provider "${p.id}" already exists`, 409, { code: 'CONFLICT' });
+    }
+
+    const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const toWrite = { ...p };
+    delete toWrite.health;
+    fs.writeFileSync(path.join(dir, `${p.id}.json`), JSON.stringify(toWrite, null, 2));
+
+    const result = await providerConfigManager.reload();
+    if (!result.success) {
+      // Roll back the file we wrote so config stays consistent.
+      fs.unlinkSync(path.join(dir, `${p.id}.json`));
+      throw new AppError('Validation failed: ' + (result.errors || []).join('; '), 400, {
+        code: 'INVALID_REQUEST', errors: result.errors,
+      });
+    }
+    res.status(201).json({ success: true, provider: providerManager.providersById.get(p.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /admin/api/providers/:id
+ *
+ * Remove a provider by deleting its config file and reloading.
+ */
+router.delete('/providers/:id', async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    if (!providerManager.providersById.has(id)) {
+      throw new AppError(`Provider "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
+    const file = path.join(dir, `${id}.json`);
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+
+    const result = await providerConfigManager.reload();
+    if (!result.success) {
+      throw new AppError('Reload after delete failed: ' + (result.errors || []).join('; '), 500, {
+        code: 'RELOAD_FAILED', errors: result.errors,
+      });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /admin/api/providers/:id/manual-models
+ *
+ * Add models to a provider's supportedModels manually and reload. Body:
+ *   { models: string[] } (added idempotently)
+ */
+router.post('/providers/:id/manual-models', async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const p = providerManager.providersById.get(id);
+    if (!p) {
+      throw new AppError(`Provider "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const models = Array.isArray(req.body && req.body.models) ? req.body.models : [];
+    const existing = new Set(p.supportedModels || []);
+    for (const m of models) if (m) existing.add(m);
+    p.supportedModels = [...existing];
+    if (p.supportedModels.length === 0) {
+      throw new AppError('"models" must be a non-empty array', 400, { code: 'INVALID_REQUEST' });
+    }
+    const result = await updateProviderOnDisk(p);
+    res.json({ success: true, provider: p, warnings: result.warnings || [] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Helper: rewrite a single provider config file + reload cascade (no disk reload).
+function updateProviderOnDisk(provider) {
+  const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const toWrite = { ...provider };
+  delete toWrite.health;
+  fs.writeFileSync(path.join(dir, `${provider.id}.json`), JSON.stringify(toWrite, null, 2));
+  providerConfigManager.reloadCascade(providerManager.listProviders());
+  return { warnings: [] };
+}
 
 module.exports = router;

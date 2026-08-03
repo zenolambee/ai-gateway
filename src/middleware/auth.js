@@ -57,6 +57,11 @@ function createAuthMiddleware({ apiKeyStore, usageTracker } = {}) {
       usageTracker.recordRequest(result.key.id);
     }
 
+    // Persist the per-key usage counter so it survives a restart (fire-and-forget).
+    if (apiKeyStore && result.key && typeof apiKeyStore.recordUsage === 'function') {
+      apiKeyStore.recordUsage(result.key.id).catch(() => {});
+    }
+
     // Enforce model restriction when the model is in the JSON body.
     // (Multipart endpoints read the model from form fields later; the
     // service layer enforces restrictions there via req.apiKey.)

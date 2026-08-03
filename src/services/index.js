@@ -44,6 +44,43 @@ const { ImagesService } = require('./imagesService');
 const { AudioService } = require('./audioService');
 const ProviderAdapterRegistry = require('../providers/providerAdapterRegistry');
 const aiService = require('./aiService');
+const { createStorage } = require('../storage');
+const MemoryStorage = require('../storage/MemoryStorage');
+const DataStore = require('../storage/DataStore');
+const { AuthAdapterFactory, ConnectionRegistry } = require('../auth');
+const logger = require('../utils/logger');
+
+// Storage backend — initialized BEFORE services so constructors can use it.
+// Default is MemoryStorage (always works). Redis is attempted asynchronously
+// and upgrades storageBackend when successful.
+let storageBackend = null;
+let storageType = 'memory';
+try {
+  const ms = new MemoryStorage({ prefix: process.env.REDIS_PREFIX || 'ai_gateway' });
+  storageBackend = ms;
+  storageType = 'memory';
+} catch (err) {
+  logger.warn('Failed to create default MemoryStorage', { error: err.message });
+}
+
+// Async Redis connection attempt — replaces storageBackend when successful.
+if ((process.env.STORAGE_PROVIDER || 'memory').toLowerCase() === 'redis' && process.env.REDIS_URL) {
+  createStorage({
+    provider: 'redis',
+    redisUrl: process.env.REDIS_URL,
+    prefix: process.env.REDIS_PREFIX || 'ai_gateway',
+    connectTimeoutMs: 3000,
+    maxRetries: 1,
+  }).then((result) => {
+    if (result.type === 'redis') {
+      storageBackend = result.storage;
+      storageType = 'redis';
+      logger.info('Storage: upgraded to Redis', { prefix: process.env.REDIS_PREFIX || 'ai_gateway' });
+    }
+  }).catch((err) => {
+    logger.warn('Storage: Redis not available, staying on MemoryStorage', { error: err.message });
+  });
+}
 
 const routingConfig = loadRoutingConfig();
 const aliasesConfig = loadAliasesConfig();
@@ -53,10 +90,20 @@ const virtualModelsConfig = loadVirtualModelsConfig();
 const providerManager = new ProviderManager();
 const apiKeyManager = new ApiKeyManager({
   defaultStrategy: routingConfig.keySelectionStrategy || 'round-robin',
+  storageProvider: storageBackend,
 });
 const httpClient = new HttpClient({ apiKeyManager });
-const metricsCollector = new MetricsCollector({ providerManager, apiKeyManager });
-const healthMonitor = new ProviderHealthMonitor({ providerManager, httpClient });
+
+const metricsCollector = new MetricsCollector({
+  providerManager,
+  apiKeyManager,
+  storageProvider: storageBackend,
+});
+const healthMonitor = new ProviderHealthMonitor({
+  providerManager,
+  httpClient,
+  storageProvider: storageBackend,
+});
 const aliasResolver = new ModelAliasResolver();
 aliasResolver.load(aliasesConfig);
 const ruleEngine = new RoutingRuleEngine();
@@ -81,7 +128,9 @@ const modelRouter = new ModelRouter(providerManager, {
 });
 modelRouter.setStrategy(routingConfig.strategy || 'priority');
 const adapterRegistry = new ProviderAdapterRegistry();
-const rateLimiter = new RateLimiter(loadRateLimitConfig());
+const rateLimiter = new RateLimiter(loadRateLimitConfig(), {
+  storageProvider: storageBackend,
+});
 const requestLog = new RequestLog();
 const requestExecutor = new RequestExecutor({
   modelRouter, httpClient, adapterRegistry,
@@ -100,15 +149,100 @@ const modelRegistry = new ModelRegistry({
 const discovery = new ProviderDiscovery({
   providerManager, httpClient, adapterRegistry, modelRegistry,
 });
-const apiKeyStore = new ApiKeyStore();
-const usageTracker = new UsageTracker();
+const apiKeyStore = new ApiKeyStore({
+  storageProvider: () => storageBackend,
+});
+// ---- Provider Adapter SDK (Sprint: Provider Adapter SDK & Built-in Providers)
+const { ProviderSDKRegistry, ProviderManifest } = require('../providers/providerSDK');
+const providerSDKRegistry = new ProviderSDKRegistry();
+providerSDKRegistry.setHttpClient(httpClient);
+
+// Register built-in provider adapters.
+const builtinAdapters = [
+  require('../providers/providerSDK/adapters/GrokAdapter'),
+  require('../providers/providerSDK/adapters/OpenAIAdapter'),
+  require('../providers/providerSDK/adapters/ClaudeAdapter'),
+  require('../providers/providerSDK/adapters/GeminiAdapter'),
+  require('../providers/providerSDK/adapters/CopilotAdapter'),
+  require('../providers/providerSDK/adapters/CursorAdapter'),
+  require('../providers/providerSDK/adapters/WindsurfAdapter'),
+  require('../providers/providerSDK/adapters/KimiAdapter'),
+  require('../providers/providerSDK/adapters/QwenAdapter'),
+];
+for (const Adapter of builtinAdapters) providerSDKRegistry.register(Adapter);
+
+// SDKRoutingBridge: routes providers through SDK adapters (sendRequest) when a
+// matching SDK adapter is registered, else falls back to the legacy path.
+const { SDKRoutingBridge } = require('../providers/providerSDK');
+const sdkRoutingBridge = new SDKRoutingBridge({ sdkRegistry: providerSDKRegistry, httpClient });
+
+// Dynamic Model Discovery (SDK fetchModels-first) + SDK Health Scheduler.
+const SDKModelDiscovery = require('./sdkModelDiscovery');
+const SDKHealthService = require('./sdkHealthService');
+const sdkModelDiscovery = new SDKModelDiscovery({
+  providerManager,
+  sdkRoutingBridge,
+  legacyDiscovery: discovery,
+  modelRegistry,
+  providerSDKRegistry,
+});
+const sdkHealthService = new SDKHealthService({
+  sdkRoutingBridge,
+  providerManager,
+  modelRouter,
+  legacyDiscovery: discovery,
+});
+// Publish an initial capability map to the router for capability-aware routing.
+sdkHealthService._publishCapabilities();
+// ---- Connect Account (Sprint: Dashboard Admin & Connect Account) ----
+// Generic auth architecture. The registry owns storage; adapters never touch
+// a storage backend. New providers = new adapter (no core change).
+const { EncryptionService, ProviderCatalog } = require('../auth');
+const encryptionService = new EncryptionService({});
+const providerCatalog = new ProviderCatalog();
+const authAdapterFactory = new AuthAdapterFactory();
+const connectionRegistry = new ConnectionRegistry({
+  factory: authAdapterFactory,
+  storageProvider: () => storageBackend,
+  encryption: encryptionService,
+  httpClient: httpClient,
+});
+connectionRegistry.setProviderCatalog(providerCatalog);
+// Wire the token manager and start the background refresh scheduler.
+const TokenManager = require('../auth/TokenManager');
+const tokenManager = new TokenManager({ registry: connectionRegistry, encryption: encryptionService });
+connectionRegistry.setTokenManager(tokenManager);
+const RefreshScheduler = require('../auth/RefreshScheduler');
+const refreshScheduler = new RefreshScheduler({ registry: connectionRegistry });
+connectionRegistry.setScheduler(refreshScheduler);
+// The scheduler starts only when the server runs (not in tests) — see server.js.
+const AccountManager = require('./accountManager');
+const accountManager = new AccountManager({
+  registry: connectionRegistry,
+  providerManager,
+  httpClient,
+});
+const ConnectionManager = require('./connectionManager');
+const connectionManager = new ConnectionManager({
+  accountManager,
+  registry: connectionRegistry,
+  factory: authAdapterFactory,
+  providerManager,
+});
+// Wire selectConnection into the executor for SDK account-level routing.
+requestExecutor.connectionManager = connectionManager;
+const usageTracker = new UsageTracker({ storageProvider: storageBackend });
 // Inject the stores into the executor (circular init avoided by late binding).
 requestExecutor.usageTracker = usageTracker;
 requestExecutor.apiKeyStore = apiKeyStore;
 requestExecutor.rateLimiter = rateLimiter;
-// Inject the apiKeyManager into the router so the rule engine can read per-key health.
+ // Inject the apiKeyManager into the router so the rule engine can read per-key health.
 modelRouter.setApiKeyManager(apiKeyManager);
 requestExecutor.rateLimiter = rateLimiter;
+// SDK routing bridge: attach so providers with an SDK adapter route through
+// adapter.sendRequest(); providers without one keep the legacy path.
+requestExecutor.sdkRouter = sdkRoutingBridge;
+modelRouter.sdkRoutingBridge = sdkRoutingBridge;
 
 // ---- Sprint 12 — Quota, Cost, Budget, Alerts, Analytics ----
 // Built AFTER the existing services so they can wrap them. Each new service
@@ -124,8 +258,8 @@ const usageAccountant = new UsageAccountant({
   persistencePath: process.env.USAGE_LEDGER_FILE || null,
   persist: process.env.USAGE_LEDGER_FILE != null,
 });
-const quotaService = new QuotaService(loadQuotaConfig());
-const budgetService = new BudgetService(loadBudgetConfig());
+const quotaService = new QuotaService(loadQuotaConfig(), { storageProvider: storageBackend });
+const budgetService = new BudgetService(loadBudgetConfig(), { storageProvider: storageBackend });
 const analyticsService = new AnalyticsService({
   usageAccountant,
   metricsCollector,
@@ -264,4 +398,41 @@ module.exports = {
   PolicySimulator,
   policyAudit,
   PolicyAuditService,
+  // Storage
+  storageBackend,
+  storageType,
+  MemoryStorage: require('../storage/MemoryStorage'),
+  RedisStorage: require('../storage/RedisStorage'),
+  StorageProvider: require('../storage/StorageProvider'),
+  // Provider Adapter SDK
+  providerSDKRegistry,
+  ProviderSDKRegistry: require('../providers/providerSDK/ProviderSDKRegistry'),
+  ProviderAdapterSDK: require('../providers/providerSDK/ProviderAdapterSDK'),
+  ProviderManifest: require('../providers/providerSDK/ProviderManifest'),
+  sdkRoutingBridge,
+  SDKRoutingBridge: require('../providers/providerSDK/SDKRoutingBridge'),
+  sdkModelDiscovery,
+  SDKModelDiscovery,
+  sdkHealthService,
+  SDKHealthService,
+  // Connect Account
+  connectionRegistry,
+  ConnectionRegistry,
+  authAdapterFactory,
+  AuthAdapterFactory,
+  AuthAdapter: require('../auth/AuthAdapter'),
+  EncryptionService: require('../auth/EncryptionService'),
+  TokenManager: require('../auth/TokenManager'),
+  RefreshScheduler: require('../auth/RefreshScheduler'),
+  ProviderCatalog: require('../auth/ProviderCatalog'),
+  refreshScheduler,
+  tokenManager,
+  encryptionService,
+  providerCatalog,
+  // Account Manager (Universal Provider Account Manager)
+  accountManager,
+  AccountManager: require('./accountManager'),
+  // Connection Manager (centralized unified service)
+  connectionManager,
+  ConnectionManager: require('./connectionManager'),
 };

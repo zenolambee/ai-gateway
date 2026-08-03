@@ -46,7 +46,20 @@ class ProviderDiscovery {
     this.intervalMs = opts.intervalMs || 300000;
     this._timer = null;
     this._discovering = false;
+    this._discovered = new Map(); // providerId -> string[]
     this.lastDiscovery = null; // { at, providers: { [id]: { ok, count, error } } }
+  }
+
+  /**
+   * Record discovered model ids for a provider.
+   * Used by discover() to store results without setting a private
+   * property on the provider config object.
+   * @param {string} providerId
+   * @param {string[]} models
+   * @private
+   */
+  _recordDiscovered(providerId, models) {
+    this._discovered.set(providerId, models);
   }
 
   /**
@@ -136,6 +149,7 @@ class ProviderDiscovery {
         const merged = [...new Set([...existing, ...r.models])];
         provider.supportedModels = merged;
         provider._discoveredModels = r.models;
+        this._recordDiscovered(provider.id, r.models);
         logger.info('ProviderDiscovery: discovered models', {
           providerId: provider.id,
           count: r.models.length,

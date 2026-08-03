@@ -40,7 +40,58 @@ class ModelRouter {
     this.strategy = this.defaultStrategy;
     // Per-model round-robin cursors (used by the round-robin routing strategy)
     this._cursors = {};
+    // SDK routing bridge (late-bound) for capability-aware SDK providers.
+    this.sdkRoutingBridge = null;
+    // Capability store for legacy providers: providerId -> capability object.
+    // Populated by discovery/health so capability routing works for legacy too.
+    this._legacyCapabilities = {};
   }
+
+  /**
+   * Set the effective capability map for providers. The object maps
+   * providerId -> capability flags { chat, responses, embeddings, images,
+   * audio, tools, vision, streaming, ... }. Used by capability-aware routing.
+   * @param {object} caps
+   */
+  setCapabilityMap(caps) {
+    if (caps && typeof caps === 'object') this._legacyCapabilities = caps;
+  }
+
+  /**
+   * Return the capability object for a provider, resolving from the SDK
+   * manifest first, then the legacy capability map.
+   * @param {object} provider
+   * @returns {object|null}
+   * @private
+   */
+  _providerCapabilities(provider) {
+    if (this.sdkRoutingBridge && typeof this.sdkRoutingBridge.capabilities === 'function') {
+      const c = this.sdkRoutingBridge.capabilities(provider);
+      if (c) return c;
+    }
+    const p = this._legacyCapabilities[provider.id];
+    if (p) return p;
+    return null;
+  }
+
+  /**
+   * Whether a provider supports a required capability. Unknown providers
+   * (no manifest, no map, no capability gate) are considered capable so
+   * capability-less deployments keep full backward compatibility.
+   * @param {object} provider
+   * @param {string} capability
+   * @returns {boolean}
+   * @private
+   */
+  _supports(provider, capability) {
+    const caps = this._providerCapabilities(provider);
+    if (!caps) return true; // unknown => allow (backward compatible)
+    const val = caps[capability];
+    // If the capability is not tracked for this provider, allow it.
+    if (val === undefined) return true;
+    return !!val;
+  }
+
 
   /**
    * Set per-model routing overrides (admin API / hot reload).
@@ -86,15 +137,37 @@ class ModelRouter {
    *   5. If providers exist for the model but all are disabled, throws 503.
    *
    * @param {string} model - model identifier (e.g. "gpt-4o")
+   * @param {object} [options] - optional { capabilities: string[] }
    * @returns {object} selected provider config
    */
-  routeToProvider(model) {
+  routeToProvider(model, options = {}) {
     if (!model || typeof model !== 'string') {
       throw new AppError(
         "you must provide a model parameter",
         400,
         { code: 'INVALID_REQUEST' }
       );
+    }
+
+    // When capability routing is requested, use the capability-aware candidate
+    // path and pick the first. Otherwise preserve the original fast path.
+    if (Array.isArray(options.capabilities) && options.capabilities.length > 0) {
+      const candidates = this.getCandidateProviders(model, { capabilities: options.capabilities });
+      if (candidates.length === 0) {
+        // No candidate supports the model with the required capabilities.
+        if (!this.providerManager.getProviderByModel) {
+          throw new AppError(`No provider supports model "${model}"`, 404, { code: 'MODEL_NOT_FOUND' });
+        }
+        // Determine whether the model exists at all vs. just lacks capability.
+        try {
+          this.providerManager.getProviderByModel(model); // throws if no model
+          // Model exists but no candidate meets the capability gate.
+          return this.providerManager.getProviderByModel(model);
+        } catch (err) {
+          throw err;
+        }
+      }
+      return candidates[0];
     }
 
     return this.providerManager.getProviderByModel(model);
@@ -131,12 +204,18 @@ class ModelRouter {
    * provider order for a given model.
    *
    * @param {string} model - model identifier or alias (e.g. "gpt-5")
+   * @param {object} [options]
+   * @param {string[]} [options.capabilities] - required capabilities; when
+   *   provided, only candidates that (per SDK manifest or legacy capability
+   *   map) support ALL of them are considered. Unknown/lack of capability
+   *   data is treated as "capable" to preserve backward compatibility.
    * @returns {Array<object>}
    */
-  getCandidateProviders(model) {
+  getCandidateProviders(model, options = {}) {
     if (!model || typeof model !== 'string') {
       return [];
     }
+    const required = Array.isArray(options.capabilities) ? options.capabilities : [];
 
     // 0. Virtual model fast path: if the requested id is a configured
     //    virtual model, ask the registry for the ordered candidates.
@@ -146,6 +225,9 @@ class ModelRouter {
       return this.virtualModelRegistry.resolveCandidates(model);
     }
 
+    // 0b. Capability-award filter for virtual models: when required
+    //     capabilities are requested and the resolved candidates exist,
+    //     filter them. Virtual registry returns candidates already ordered.
     // 1. Resolve alias to canonical model ids (returns [model] when not an alias).
     const modelIds = this.aliasResolver ? this.aliasResolver.resolve(model) : [model];
 
@@ -160,6 +242,11 @@ class ModelRouter {
           candidates.push(p);
         }
       }
+    }
+
+    // 2b. Capability-aware filter (when required capabilities are given).
+    if (required.length > 0) {
+      candidates = candidates.filter((p) => required.every((cap) => this._supports(p, cap)));
     }
 
     if (candidates.length === 0) return candidates;

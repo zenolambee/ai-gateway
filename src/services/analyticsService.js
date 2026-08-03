@@ -228,7 +228,7 @@ class AnalyticsService {
               type: 'provider_cost_spike', severity: 'warning', source: 'analytics',
               message: `Provider "${id}" cost-per-request ($${avgPerReq.toFixed(6)}) is ${this.costSpikeRatio}x the global average ($${globalAvg.toFixed(6)})`,
               context: { providerId: id, perRequest: avgPerReq, globalAverage: globalAvg },
-              dedupeKey: `cost-spike:${id}:${this.usage._day(Date.now())}`,
+              dedupeKey: `cost-spike:${id}:${this.usage.dayString(Date.now())}`,
             });
             if (a) raised += 1;
           }
@@ -247,7 +247,7 @@ class AnalyticsService {
               type: 'abnormal_token_usage', severity: 'warning', source: 'analytics',
               message: `Request ${last.requestId || last.seq} used ${last.totalTokens} tokens (${this.abnormalTokenRatio}× the recent average of ${Math.round(avgTokens)})`,
               context: { requestId: last.requestId, totalTokens: last.totalTokens, average: avgTokens },
-              dedupeKey: `abn:${this.usage._day(Date.now())}`,
+              dedupeKey: `abn:${this.usage.dayString(Date.now())}`,
             });
             if (a) raised += 1;
           }

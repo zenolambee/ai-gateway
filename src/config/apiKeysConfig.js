@@ -52,6 +52,19 @@ function normalizeKeyEntry(entry, index) {
       allowedProviders: Array.isArray(entry.allowedProviders) ? entry.allowedProviders : undefined,
       allowedModels: Array.isArray(entry.allowedModels) ? entry.allowedModels : undefined,
       createdAt: typeof entry.createdAt === 'number' ? entry.createdAt : Math.floor(Date.now() / 1000),
+      description: entry.description,
+      updatedAt: typeof entry.updatedAt === 'number' ? entry.updatedAt : undefined,
+      enabled: typeof entry.enabled === 'boolean' ? entry.enabled : undefined,
+      revoked: typeof entry.revoked === 'boolean' ? entry.revoked : undefined,
+      lastUsed: typeof entry.lastUsed === 'number' ? entry.lastUsed : undefined,
+      usageCount: typeof entry.usageCount === 'number' ? entry.usageCount : 0,
+      permissions: entry.permissions,
+      deniedProviders: Array.isArray(entry.deniedProviders) ? entry.deniedProviders : undefined,
+      deniedModels: Array.isArray(entry.deniedModels) ? entry.deniedModels : undefined,
+      rateLimit: entry.rateLimit,
+      quota: entry.quota,
+      metadata: entry.metadata,
+      tags: Array.isArray(entry.tags) ? entry.tags : undefined,
     };
   }
 

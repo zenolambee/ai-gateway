@@ -5,9 +5,9 @@ const STATE_OPEN = 'open';
 const STATE_HALF_OPEN = 'half-open';
 
 const DEFAULT_FAILURE_THRESHOLD = 5;
-const DEFAULT_RESET_TIMEOUT_MS = 30000; // 30s before half-open probe
+const DEFAULT_RESET_TIMEOUT_MS = 30000;
 const DEFAULT_HALF_OPEN_MAX_PROBES = 1;
-const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 60000; // 60s
+const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 60000;
 
 /**
  * Create a fresh per-provider health record.
@@ -32,31 +32,22 @@ function newHealth() {
 /**
  * ProviderHealthMonitor
  *
- * Tracks per-provider health with a circuit-breaker state machine:
+ * Tracks per-provider health with a circuit-breaker state machine.
  *
- *   closed    -> all requests allowed; failures increment consecutiveFailures
- *   open      -> requests blocked; after resetTimeout, transition to half-open
- *   half-open -> a limited number of probe requests are allowed; on success
- *                the circuit closes, on failure it re-opens
- *
- * The monitor is driven by the RequestExecutor (recordSuccess /
- * recordFailure) and optionally by a periodic health check timer.
- * Providers that recover automatically become available again.
- *
- * The executor calls `isAvailable(providerId)` before using a provider; when
- * the circuit is open, the provider is skipped (treated like a fallback).
- *
- * NO HTTP, NO retry — pure state machine.
+ * When a storageProvider is given, health records are persisted through it
+ * so state survives restarts. Without storageProvider, everything is
+ * in-memory (pure backward compat).
  */
 class ProviderHealthMonitor {
   /**
    * @param {object} [opts]
-   * @param {number} [opts.failureThreshold=5] - consecutive failures to open
-   * @param {number} [opts.resetTimeoutMs=30000] - time before half-open
-   * @param {number} [opts.halfOpenMaxProbes=1] - probes allowed in half-open
-   * @param {number} [opts.healthCheckIntervalMs=60000] - periodic check
-   * @param {object} [opts.providerManager] - for listing providers to check
-   * @param {object} [opts.httpClient] - for health-check probes
+   * @param {number} [opts.failureThreshold=5]
+   * @param {number} [opts.resetTimeoutMs=30000]
+   * @param {number} [opts.halfOpenMaxProbes=1]
+   * @param {number} [opts.healthCheckIntervalMs=60000]
+   * @param {object} [opts.providerManager]
+   * @param {object} [opts.httpClient]
+   * @param {object} [opts.storageProvider] - optional StorageProvider instance
    */
   constructor(opts = {}) {
     this.failureThreshold = opts.failureThreshold || DEFAULT_FAILURE_THRESHOLD;
@@ -65,16 +56,14 @@ class ProviderHealthMonitor {
     this.healthCheckIntervalMs = opts.healthCheckIntervalMs || DEFAULT_HEALTH_CHECK_INTERVAL_MS;
     this.providerManager = opts.providerManager || null;
     this.httpClient = opts.httpClient || null;
+    this._store = opts.storageProvider || null;
 
-    this.health = new Map(); // providerId -> health record
+    this.health = new Map();
     this._timer = null;
   }
 
   /**
    * Ensure a health record exists for a provider.
-   * @param {string} providerId
-   * @returns {object}
-   * @private
    */
   _ensure(providerId) {
     if (!this.health.has(providerId)) {
@@ -84,12 +73,30 @@ class ProviderHealthMonitor {
   }
 
   /**
-   * Record a successful request against a provider. In half-open state, a
-   * success closes the circuit. Resets consecutive failures.
-   *
-   * @param {object} detail
-   * @param {string} detail.providerId
-   * @param {number} [detail.latencyMs]
+   * Persist the health record for a provider to storage (fire-and-forget).
+   */
+  _persist(providerId) {
+    if (!this._store) return;
+    const h = this.health.get(providerId);
+    if (!h) return;
+    this._store.hset(`health:${providerId}`, {
+      state: h.state,
+      consecutiveFailures: h.consecutiveFailures,
+      consecutiveSuccesses: h.consecutiveSuccesses,
+      lastSuccess: h.lastSuccess,
+      lastFailure: h.lastFailure,
+      averageLatencyMs: h.averageLatencyMs,
+      latencyCount: h.latencyCount,
+      latencySum: h.latencySum,
+      totalSuccess: h.totalSuccess,
+      totalFailure: h.totalFailure,
+      openedAt: h.openedAt,
+      halfOpenProbes: h.halfOpenProbes,
+    }).catch(() => {});
+  }
+
+  /**
+   * Record a successful request against a provider.
    */
   recordSuccess(detail = {}) {
     const { providerId, latencyMs } = detail;
@@ -113,15 +120,12 @@ class ProviderHealthMonitor {
       h.halfOpenProbes = 0;
       logger.info('Provider circuit closed (recovered)', { providerId });
     }
+
+    this._persist(providerId);
   }
 
   /**
-   * Record a failed request against a provider. Increments consecutive
-   * failures and opens the circuit when the threshold is reached.
-   *
-   * @param {object} detail
-   * @param {string} detail.providerId
-   * @param {string} [detail.errorCode]
+   * Record a failed request against a provider.
    */
   recordFailure(detail = {}) {
     const { providerId } = detail;
@@ -134,7 +138,6 @@ class ProviderHealthMonitor {
     h.lastFailure = Date.now();
 
     if (h.state === STATE_HALF_OPEN) {
-      // A failure during half-open re-opens the circuit.
       h.state = STATE_OPEN;
       h.openedAt = Date.now();
       h.halfOpenProbes = 0;
@@ -148,15 +151,12 @@ class ProviderHealthMonitor {
         threshold: this.failureThreshold,
       });
     }
+
+    this._persist(providerId);
   }
 
   /**
-   * Whether a provider is currently available to serve requests. When the
-   * circuit is open, the provider is skipped (unless the reset timeout has
-   * elapsed, in which case it transitions to half-open and allows a probe).
-   *
-   * @param {string} providerId
-   * @returns {boolean}
+   * Whether a provider is currently available to serve requests.
    */
   isAvailable(providerId) {
     if (!providerId) return true;
@@ -165,20 +165,20 @@ class ProviderHealthMonitor {
     if (h.state === STATE_CLOSED) return true;
 
     if (h.state === STATE_OPEN) {
-      // Check if enough time has elapsed to try a half-open probe.
       if (h.openedAt && (Date.now() - h.openedAt) >= this.resetTimeoutMs) {
         h.state = STATE_HALF_OPEN;
         h.halfOpenProbes = 0;
         logger.info('Provider circuit half-open (probe allowed)', { providerId });
+        this._persist(providerId);
         return true;
       }
       return false;
     }
 
     if (h.state === STATE_HALF_OPEN) {
-      // Allow a limited number of probes.
       if (h.halfOpenProbes < this.halfOpenMaxProbes) {
         h.halfOpenProbes += 1;
+        this._persist(providerId);
         return true;
       }
       return false;
@@ -189,8 +189,6 @@ class ProviderHealthMonitor {
 
   /**
    * Return the health snapshot for a single provider.
-   * @param {string} providerId
-   * @returns {object|null}
    */
   getHealth(providerId) {
     const h = this.health.get(providerId);
@@ -200,7 +198,6 @@ class ProviderHealthMonitor {
 
   /**
    * Return health snapshots for all tracked providers.
-   * @returns {object} map of providerId -> health snapshot
    */
   getAllHealth() {
     const out = {};
@@ -212,10 +209,6 @@ class ProviderHealthMonitor {
 
   /**
    * Project a health record into a serializable snapshot.
-   * @param {string} providerId
-   * @param {object} h
-   * @returns {object}
-   * @private
    */
   _snapshot(providerId, h) {
     const total = h.totalSuccess + h.totalFailure;
@@ -235,12 +228,7 @@ class ProviderHealthMonitor {
   }
 
   /**
-   * Start the periodic health-check timer. For each enabled provider, the
-   * monitor issues a lightweight probe (a GET to the provider's base URL).
-   * A successful probe records a success (recovering an open circuit); a
-   * failed probe records a failure.
-   *
-   * The timer is skipped when no httpClient or providerManager is attached.
+   * Start the periodic health-check timer.
    */
   startHealthChecks() {
     this.stopHealthChecks();
@@ -249,7 +237,6 @@ class ProviderHealthMonitor {
     const check = async () => {
       const providers = this.providerManager.getEnabledProviders();
       for (const provider of providers) {
-        // Don't probe providers whose circuit is closed and healthy.
         const h = this.health.get(provider.id);
         if (h && h.state === STATE_CLOSED && h.consecutiveFailures === 0) continue;
 
@@ -281,6 +268,12 @@ class ProviderHealthMonitor {
    */
   reset() {
     this.health.clear();
+    if (this._store) {
+      // Best-effort clear
+      this._store.keys('health:*').then((keys) => {
+        for (const k of keys) this._store.del(k).catch(() => {});
+      }).catch(() => {});
+    }
   }
 }
 

@@ -17,8 +17,8 @@ class NvidiaAdapter extends GenericOpenAIAdapter {
       supportsResponses: false,
       supportsStreaming: true,
       supportsEmbeddings: true,
-      supportsImages: true,
-      supportsAudio: true,
+      supportsImages: false,
+      supportsAudio: false,
       supportsTools: true,
       supportsReasoning: false,
     };

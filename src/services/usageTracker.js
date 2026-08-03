@@ -1,7 +1,7 @@
 /**
  * UsageTracker
  *
- * Tracks per-API-key usage statistics in memory:
+ * Tracks per-API-key usage statistics:
  *   - total requests
  *   - total tokens (prompt + completion)
  *   - per-provider request counts
@@ -15,16 +15,22 @@
  * RequestExecutor (token/provider/model counts after a successful
  * response).
  *
- * NO persistence — all stats are in-memory for the lifetime of the process.
+ * When a storageProvider is given, all state is persisted through it
+ * (Redis or MemoryStorage). Without a storageProvider, the default
+ * in-memory Map is used (pure backward compat).
  */
 class UsageTracker {
-  constructor() {
+  /**
+   * @param {object} [opts]
+   * @param {object} [opts.storageProvider] - optional StorageProvider instance
+   */
+  constructor(opts = {}) {
+    this._store = opts.storageProvider || null;
     this.statsByKey = new Map();
   }
 
   /**
-   * Ensure a stats record exists for a key id. Creates one with the given
-   * createdAt (or now) on first access.
+   * Ensure a stats record exists for a key id. Creates one on first access.
    * @param {string} keyId
    * @returns {object}
    * @private
@@ -40,8 +46,24 @@ class UsageTracker {
         lastUsed: null,
         createdAt: Math.floor(Date.now() / 1000),
       });
+      // Persist initial record when storage is available
+      if (this._store) {
+        this._store.hset(`usage:${keyId}`, this.statsByKey.get(keyId)).catch(() => {});
+      }
     }
     return this.statsByKey.get(keyId);
+  }
+
+  /**
+   * Persist a specific field change to storage (fire-and-forget).
+   * @param {string} keyId
+   * @param {object} updates
+   * @private
+   */
+  _persist(keyId, updates) {
+    if (this._store) {
+      this._store.hset(`usage:${keyId}`, updates).catch(() => {});
+    }
   }
 
   /**
@@ -54,6 +76,7 @@ class UsageTracker {
     const stats = this._ensure(keyId);
     stats.totalRequests += 1;
     stats.lastUsed = Math.floor(Date.now() / 1000);
+    this._persist(keyId, { totalRequests: stats.totalRequests, lastUsed: stats.lastUsed });
   }
 
   /**
@@ -83,6 +106,13 @@ class UsageTracker {
     if (detail.model) {
       stats.modelUsage[detail.model] = (stats.modelUsage[detail.model] || 0) + 1;
     }
+
+    this._persist(keyId, {
+      totalTokens: stats.totalTokens,
+      lastUsed: stats.lastUsed,
+      providerUsage: { ...stats.providerUsage },
+      modelUsage: { ...stats.modelUsage },
+    });
   }
 
   /**
@@ -108,6 +138,9 @@ class UsageTracker {
    */
   reset() {
     this.statsByKey.clear();
+    if (this._store) {
+      this._store.flush().catch(() => {});
+    }
   }
 }
 

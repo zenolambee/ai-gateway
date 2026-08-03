@@ -69,13 +69,16 @@ function windowResetMs(window, startMs) {
 class BudgetService {
   /**
    * @param {object} config - output of loadBudgetConfig()
+   * @param {object} [opts]
+   * @param {object} [opts.storageProvider] - optional StorageProvider instance
    */
-  constructor(config = {}) {
+  constructor(config = {}, opts = {}) {
     this.enabled = !!config.enabled;
-    this.budgets = []; // [{ id, scope, scopeId, window, limit, onExceed, warnPct, stopPct }]
-    this.counters = new Map(); // budgetId -> { windowStart, totalCost, peakCost }
-    this.alerts = null; // injected (AlertService) — optional
+    this.budgets = [];
+    this.counters = new Map();
+    this.alerts = null;
     this.config = config;
+    this._store = opts.storageProvider || null;
     this.load(config);
   }
 
@@ -126,6 +129,21 @@ class BudgetService {
       c.lastReset = now;
     }
     return c;
+  }
+
+  /**
+   * Persist a budget counter to storage (fire-and-forget).
+   */
+  _persistCounter(budgetId) {
+    if (!this._store) return;
+    const c = this.counters.get(budgetId);
+    if (!c) return;
+    this._store.hset(`budget:${budgetId}`, {
+      totalCost: c.totalCost,
+      peakCost: c.peakCost,
+      windowStart: c.windowStart,
+      lastReset: c.lastReset,
+    }).catch(() => {});
   }
 
   /**
@@ -233,6 +251,7 @@ class BudgetService {
       const before = c.totalCost;
       c.totalCost = Math.round((c.totalCost + cost) * 1e8) / 1e8;
       c.peakCost = Math.max(c.peakCost, c.totalCost);
+      this._persistCounter(b.id);
       const ratioBefore = b.limit > 0 ? before / b.limit : 0;
       const ratioAfter = b.limit > 0 ? c.totalCost / b.limit : 0;
       const warnPct = b.warnThresholdPercent / 100;
