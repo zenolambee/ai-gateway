@@ -1,5 +1,6 @@
 const logger = require('../utils/logger');
 const { loadApiKeys } = require('../config/apiKeysConfig');
+const ApiKeyHasher = require('./apiKeyHasher');
 
 /**
  * ApiKeyStore
@@ -49,11 +50,13 @@ class ApiKeyStore {
   constructor(opts = {}) {
     this.keys = [];
     this.keysByKey = new Map();
+    this.keysByHash = new Map();
     this.loaded = false;
     this._store = opts.storageProvider || null;
     this._prefix = opts.prefix || 'gatewayKey';
     this._migrationDone = false;
     this._managed = new Set(); // ids explicitly written via store methods
+    this._hasher = opts.hasher || new ApiKeyHasher();
   }
 
   /** Resolve the current StorageProvider (instance or getter). */
@@ -61,6 +64,40 @@ class ApiKeyStore {
     const s = this._store;
     if (typeof s === 'function') return s();
     return s;
+  }
+
+  /**
+   * Ensure a key record carries `keyHash` and `keyPrefix` fields. For legacy
+   * records that still hold a plaintext `key`, the hash/prefix are derived
+   * from it (so hash-based lookup works for config/env keys too). Records that
+   * were created via the hashed-generation path already have these fields and
+   * may omit the plaintext `key`.
+   * @param {object} record
+   * @private
+   */
+  _ensureHashFields(record) {
+    if (!record) return record;
+    if (!record.keyHash && record.key) {
+      record.keyHash = this._hasher.hash(record.key);
+    }
+    if (!record.keyPrefix && record.key) {
+      record.keyPrefix = this._hasher.fingerprint(record.key);
+    }
+    return record;
+  }
+
+  /** Re-index a record in both the plaintext and hash maps. */
+  _index(record) {
+    if (!record) return;
+    if (record.key) this.keysByKey.set(record.key, record);
+    if (record.keyHash) this.keysByHash.set(record.keyHash, record);
+  }
+
+  /** Remove a record from both indexes. */
+  _deindex(record) {
+    if (!record) return;
+    if (record.key) this.keysByKey.delete(record.key);
+    if (record.keyHash) this.keysByHash.delete(record.keyHash);
   }
 
   _storageKey(id) {
@@ -134,8 +171,11 @@ class ApiKeyStore {
     const keys = loadApiKeys(file);
     this.keys = keys;
     this.keysByKey = new Map();
+    this.keysByHash = new Map();
     for (const k of keys) {
-      this.keysByKey.set(k.key, k);
+      this._ensureHashFields(k);
+      if (k.key) this.keysByKey.set(k.key, k);
+      if (k.keyHash) this.keysByHash.set(k.keyHash, k);
     }
     this.loaded = true;
 
@@ -246,10 +286,15 @@ class ApiKeyStore {
     const byKey = new Map(this.keys.map((r) => [r.key, r]));
     for (const r of records) {
       if (this._managed.has(r.id)) continue;
+      this._ensureHashFields(r);
       if (r.key) byKey.set(r.key, r);
+      else byKey.set(r.id, r); // hashed-only records keyed by id in the temp map
     }
     this.keys = [...byKey.values()];
-    this.keysByKey = byKey;
+    // Rebuild both indexes from the merged set.
+    this.keysByKey = new Map();
+    this.keysByHash = new Map();
+    for (const r of this.keys) this._index(r);
     restored = records.length;
 
     if (restored > 0) {
@@ -315,6 +360,24 @@ class ApiKeyStore {
   }
 
   /**
+   * Compute the effective status of a key, deriving 'expired' from expiresAt
+   * without mutating the stored record. Persisted status stays 'active' so the
+   * transition to expired is purely time-based (revoked is explicit).
+   * @param {object} record
+   * @returns {'active'|'inactive'|'revoked'|'expired'}
+   */
+  effectiveStatus(record) {
+    if (!record) return 'inactive';
+    if (record.status === 'revoked') return 'revoked';
+    if (record.status === 'inactive') return 'inactive';
+    if (record.expiresAt) {
+      const now = Math.floor(Date.now() / 1000);
+      if (record.expiresAt <= now) return 'expired';
+    }
+    return 'active';
+  }
+
+  /**
    * Validate a presented Bearer token. Returns the key record (with
    * restrictions) when valid, or an error descriptor when invalid.
    *
@@ -336,9 +399,17 @@ class ApiKeyStore {
       return { valid: false, error: { code: 'MISSING_API_KEY', message: "No API key provided. Set the 'Authorization: Bearer <key>' header." } };
     }
 
-    const record = this.keysByKey.get(presentedKey);
+    // Prefer hash-based lookup (works for both hashed-only and legacy records
+    // since legacy records get a derived keyHash on load). Fall back to the
+    // plaintext index for any record that somehow lacks a hash.
+    const hash = this._hasher.hash(presentedKey);
+    let record = (hash && this.keysByHash.get(hash)) || this.keysByKey.get(presentedKey);
     if (!record) {
       return { valid: false, error: { code: 'INVALID_API_KEY', message: 'Invalid API key provided.' } };
+    }
+
+    if (record.status === 'revoked') {
+      return { valid: false, error: { code: 'REVOKED_API_KEY', message: 'This API key has been revoked.' } };
     }
 
     if (record.status === 'inactive') {
@@ -385,10 +456,13 @@ class ApiKeyStore {
     const record = {
       id: payload.id || key,
       key,
+      keyHash: payload.keyHash,
+      keyPrefix: payload.keyPrefix,
       name: payload.name || `key-${now}`,
       description: payload.description,
       status: this._resolveStatus(payload),
       role: payload.role === 'admin' ? 'admin' : 'user',
+      userId: payload.userId,
       expiresAt: typeof payload.expiresAt === 'number' ? payload.expiresAt : undefined,
       allowedProviders: Array.isArray(payload.allowedProviders) ? payload.allowedProviders : undefined,
       deniedProviders: Array.isArray(payload.deniedProviders) ? payload.deniedProviders : undefined,
@@ -396,19 +470,196 @@ class ApiKeyStore {
       deniedModels: Array.isArray(payload.deniedModels) ? payload.deniedModels : undefined,
       permissions: Array.isArray(payload.permissions) ? payload.permissions : payload.permissions,
       rateLimit: payload.rateLimit,
-      quota: payload.quota,
+      quota: this._normalizeQuota(payload.quota),
       metadata: payload.metadata,
       tags: Array.isArray(payload.tags) ? payload.tags : undefined,
       createdAt: now,
       updatedAt: now,
+      revokedAt: null,
       lastUsed: typeof payload.lastUsed === 'number' ? payload.lastUsed : null,
       usageCount: typeof payload.usageCount === 'number' ? payload.usageCount : 0,
     };
+    // Derive hash/prefix for legacy plaintext-key creation paths.
+    this._ensureHashFields(record);
     this.keys.push(record);
-    this.keysByKey.set(record.key, record);
+    this._index(record);
     this._managed.add(record.id);
     await this._persist(record);
     return record;
+  }
+
+  /**
+   * Generate a brand-new API key: creates a cryptographically-secure random
+   * key, stores ONLY its hash + prefix (never the plaintext), and returns the
+   * created record together with the one-time plaintext key.
+   *
+   * The returned `rawKey` is the ONLY time the plaintext is available — it is
+   * never logged, never persisted, and never returned again.
+   *
+   * @param {object} payload - same metadata fields as createKey (minus `key`)
+   * @returns {Promise<{ record: object, rawKey: string }>}
+   */
+  async generateKey(payload = {}) {
+    const { rawKey, keyHash, keyPrefix } = this._hasher.generate();
+    const now = Math.floor(Date.now() / 1000);
+    const record = {
+      id: payload.id || `key_${keyHash.slice(0, 16)}`,
+      // NOTE: no plaintext `key` field is stored.
+      keyHash,
+      keyPrefix,
+      name: payload.name || `key-${now}`,
+      description: payload.description,
+      status: this._resolveStatus(payload),
+      role: payload.role === 'admin' ? 'admin' : 'user',
+      userId: payload.userId,
+      expiresAt: typeof payload.expiresAt === 'number' ? payload.expiresAt : undefined,
+      allowedProviders: Array.isArray(payload.allowedProviders) ? payload.allowedProviders : undefined,
+      deniedProviders: Array.isArray(payload.deniedProviders) ? payload.deniedProviders : undefined,
+      allowedModels: Array.isArray(payload.allowedModels) ? payload.allowedModels : undefined,
+      deniedModels: Array.isArray(payload.deniedModels) ? payload.deniedModels : undefined,
+      permissions: Array.isArray(payload.permissions) ? payload.permissions : payload.permissions,
+      rateLimit: payload.rateLimit,
+      quota: this._normalizeQuota(payload.quota),
+      metadata: payload.metadata,
+      tags: Array.isArray(payload.tags) ? payload.tags : undefined,
+      createdAt: now,
+      updatedAt: now,
+      revokedAt: null,
+      lastUsed: null,
+      usageCount: 0,
+    };
+    this.keys.push(record);
+    this._index(record);
+    this._managed.add(record.id);
+    await this._persist(record);
+    return { record, rawKey };
+  }
+
+  /**
+   * Revoke a key by id. Sets status='revoked' and stamps revokedAt, but keeps
+   * the record (and its historical usage) intact. Returns the updated record
+   * or null when not found.
+   * @param {string} id
+   * @returns {Promise<object|null>}
+   */
+  async revokeKey(id) {
+    const record = this.keys.find((k) => k.id === id);
+    if (!record) return null;
+    record.status = 'revoked';
+    record.revokedAt = Math.floor(Date.now() / 1000);
+    record.updatedAt = record.revokedAt;
+    this._managed.add(record.id);
+    await this._persist(record);
+    return record;
+  }
+
+  /**
+   * Rotate a key: generate a new secret for an EXISTING key record, preserving
+   * its id, metadata, permissions, quota, and historical usage. The old hash
+   * is removed from the index so the previous plaintext stops working
+   * immediately. Returns the record + the new one-time plaintext key.
+   * @param {string} id
+   * @returns {Promise<{ record: object, rawKey: string }|null>}
+   */
+  async rotateKey(id) {
+    const record = this.keys.find((k) => k.id === id);
+    if (!record) return null;
+    const { rawKey, keyHash, keyPrefix } = this._hasher.generate();
+    // Drop old indexes.
+    this._deindex(record);
+    // Legacy plaintext key (if any) is discarded — only the hash is kept.
+    delete record.key;
+    record.keyHash = keyHash;
+    record.keyPrefix = keyPrefix;
+    record.status = 'active';
+    record.revokedAt = null;
+    record.updatedAt = Math.floor(Date.now() / 1000);
+    this._index(record);
+    this._managed.add(record.id);
+    await this._persist(record);
+    return { record, rawKey };
+  }
+
+  /**
+   * Normalize a quota object to the canonical { limit, used, remaining } shape.
+   * `remaining` is always derived (never trusted from input) via the single
+   * formula remaining = max(0, limit - used). Returns undefined when no quota.
+   * @param {object} [quota]
+   * @returns {object|undefined}
+   * @private
+   */
+  _normalizeQuota(quota) {
+    if (!quota || typeof quota !== 'object') return quota;
+    const limit = typeof quota.limit === 'number' ? quota.limit : null;
+    const used = typeof quota.used === 'number' ? quota.used : 0;
+    const out = { ...quota, limit, used };
+    if (limit != null) out.remaining = Math.max(0, limit - used);
+    return out;
+  }
+
+  /**
+   * Whether a key's token quota is already exhausted (used >= limit). Keys
+   * without a numeric quota limit are never exhausted.
+   * @param {object} record
+   * @returns {boolean}
+   */
+  isQuotaExhausted(record) {
+    if (!record || !record.quota || typeof record.quota.limit !== 'number') return false;
+    const used = typeof record.quota.used === 'number' ? record.quota.used : 0;
+    return used >= record.quota.limit;
+  }
+
+  /**
+   * Atomically consume quota for a key. Uses the storage backend's atomic
+   * hash-increment when available (safe under concurrent requests), then
+   * mirrors the new total into the in-memory record. Falls back to an
+   * in-process increment when no storage is attached. `remaining` is always
+   * recomputed from the single formula.
+   *
+   * @param {string} id - key id
+   * @param {number} amount - tokens (or units) to consume
+   * @returns {Promise<{ used:number, limit:(number|null), remaining:(number|null) }|null>}
+   */
+  async consumeQuota(id, amount) {
+    const record = this.keys.find((k) => k.id === id);
+    if (!record || !record.quota || typeof amount !== 'number' || amount <= 0) {
+      return record && record.quota ? {
+        used: record.quota.used || 0,
+        limit: typeof record.quota.limit === 'number' ? record.quota.limit : null,
+        remaining: typeof record.quota.limit === 'number' ? Math.max(0, record.quota.limit - (record.quota.used || 0)) : null,
+      } : null;
+    }
+    const store = this._getStore();
+    let used;
+    if (store && typeof store.hincr === 'function') {
+      try {
+        used = await store.hincr(`${this._prefix}:quota:${id}`, 'used', amount);
+      } catch {
+        used = (record.quota.used || 0) + amount;
+      }
+    } else {
+      used = (record.quota.used || 0) + amount;
+    }
+    record.quota.used = used;
+    const limit = typeof record.quota.limit === 'number' ? record.quota.limit : null;
+    record.quota.remaining = limit != null ? Math.max(0, limit - used) : null;
+    record.updatedAt = Math.floor(Date.now() / 1000);
+    this._managed.add(record.id);
+    await this._persist(record);
+    return { used, limit, remaining: record.quota.remaining };
+  }
+
+  /**
+   * Read the current quota status for a key.
+   * @param {string} id
+   * @returns {{ limit:(number|null), used:number, remaining:(number|null) }|null}
+   */
+  getQuota(id) {
+    const record = this.keys.find((k) => k.id === id);
+    if (!record || !record.quota) return null;
+    const limit = typeof record.quota.limit === 'number' ? record.quota.limit : null;
+    const used = typeof record.quota.used === 'number' ? record.quota.used : 0;
+    return { limit, used, remaining: limit != null ? Math.max(0, limit - used) : null };
   }
 
   /**
@@ -425,7 +676,7 @@ class ApiKeyStore {
     const allowed = [
       'status', 'role', 'expiresAt', 'name', 'description', 'allowedProviders',
       'deniedProviders', 'allowedModels', 'deniedModels', 'permissions',
-      'rateLimit', 'quota', 'metadata', 'tags', 'enabled', 'revoked',
+      'rateLimit', 'quota', 'metadata', 'tags', 'enabled', 'revoked', 'userId',
     ];
     let changed = false;
     for (const field of allowed) {
@@ -433,7 +684,12 @@ class ApiKeyStore {
       if (field === 'enabled') {
         record.status = patch[field] ? 'active' : 'inactive';
       } else if (field === 'revoked') {
-        if (patch[field]) record.status = 'inactive';
+        if (patch[field]) {
+          record.status = 'revoked';
+          record.revokedAt = Math.floor(Date.now() / 1000);
+        }
+      } else if (field === 'quota') {
+        record.quota = this._normalizeQuota(patch[field]);
       } else {
         record[field] = patch[field];
       }
@@ -444,9 +700,11 @@ class ApiKeyStore {
       record.updatedAt = Math.floor(Date.now() / 1000);
       // Rebuild the key index in case the key value changed.
       if (patch.key && patch.key !== record.key) {
-        this.keysByKey.delete(record.key);
+        this._deindex(record);
         record.key = patch.key;
-        this.keysByKey.set(record.key, record);
+        record.keyHash = this._hasher.hash(patch.key);
+        record.keyPrefix = this._hasher.fingerprint(patch.key);
+        this._index(record);
       }
       this._managed.add(record.id);
       await this._persist(record);
@@ -464,18 +722,19 @@ class ApiKeyStore {
     const idx = this.keys.findIndex((k) => k.id === id);
     if (idx < 0) return false;
     const [record] = this.keys.splice(idx, 1);
-    this.keysByKey.delete(record.key);
+    this._deindex(record);
     await this._remove(id);
     return true;
   }
 
   /**
-   * Resolve `status` from a payload, honoring the new `enabled`/`revoked`
+   * Resolve `status` from a payload, honoring the `enabled`/`revoked`
    * fields while remaining backward compatible with the existing `status`.
    * @private
    */
   _resolveStatus(payload) {
-    if (payload.revoked) return 'inactive';
+    if (payload.revoked) return 'revoked';
+    if (payload.status === 'revoked') return 'revoked';
     if (payload.enabled !== undefined) return payload.enabled ? 'active' : 'inactive';
     return payload.status === 'inactive' ? 'inactive' : 'active';
   }
@@ -534,8 +793,9 @@ class ApiKeyStore {
       id: k.id,
       name: k.name,
       description: k.description,
-      status: k.status,
+      status: this.effectiveStatus(k),
       role: k.role || 'user',
+      userId: k.userId,
       expiresAt: k.expiresAt,
       allowedProviders: k.allowedProviders,
       deniedProviders: k.deniedProviders,
@@ -543,14 +803,24 @@ class ApiKeyStore {
       deniedModels: k.deniedModels,
       permissions: k.permissions,
       rateLimit: k.rateLimit,
-      quota: k.quota,
+      quota: k.quota ? {
+        limit: typeof k.quota.limit === 'number' ? k.quota.limit : null,
+        used: typeof k.quota.used === 'number' ? k.quota.used : 0,
+        remaining: typeof k.quota.limit === 'number'
+          ? Math.max(0, k.quota.limit - (k.quota.used || 0))
+          : null,
+      } : undefined,
       metadata: k.metadata,
       tags: k.tags,
       createdAt: k.createdAt,
       updatedAt: k.updatedAt,
+      revokedAt: k.revokedAt || null,
       lastUsed: k.lastUsed,
       usageCount: k.usageCount,
-      keyPrefix: k.key ? `${k.key.slice(0, 4)}...${k.key.slice(-4)}` : '',
+      // keyPrefix is the non-secret fingerprint; prefer the stored one, else
+      // derive a masked prefix from any legacy plaintext key. Never expose the
+      // raw key or the keyHash.
+      keyPrefix: k.keyPrefix || (k.key ? `${k.key.slice(0, 4)}...${k.key.slice(-4)}` : ''),
     };
   }
 

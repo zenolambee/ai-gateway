@@ -160,6 +160,111 @@ async function testRouting() {
 }
 
 // ---------------------------------------------------------------
+// 9. Runtime credential resolution (ConnectionManager → transport auth)
+// ---------------------------------------------------------------
+async function testRuntimeAuthResolution() {
+  const cm = require('../src/services').connectionManager;
+
+  // api-key connection → resolves to an apiKey (Bearer) with no headers.
+  const ak = await cm.registerConnection({
+    accountId: 'rt-apikey', providerId: 'rt-apikey-prov', authType: 'api-key',
+    displayName: 'RT ApiKey', apiKey: 'sk-runtime-123', priority: 1,
+  });
+  const akAuth = await cm.resolveRuntimeAuth('rt-apikey-prov');
+  record('runtime: api-key resolves apiKey', !!akAuth && akAuth.apiKey === 'sk-runtime-123');
+  record('runtime: api-key connectionId', akAuth && akAuth.connectionId === 'rt-apikey');
+  record('runtime: api-key no auth headers', akAuth && Object.keys(akAuth.headers).length === 0);
+  await cm.disconnect(ak.id);
+
+  // oauth connection → resolves to an Authorization: Bearer header, no apiKey.
+  const oa = await cm.registerConnection({
+    accountId: 'rt-oauth', providerId: 'rt-oauth-prov', authType: 'oauth',
+    displayName: 'RT OAuth', accessToken: 'tok-runtime-xyz', refreshToken: 'rt-xyz',
+  });
+  const oaAuth = await cm.resolveRuntimeAuth('rt-oauth-prov');
+  record('runtime: oauth resolves Bearer header', !!oaAuth && oaAuth.headers.Authorization === 'Bearer tok-runtime-xyz');
+  record('runtime: oauth no apiKey', oaAuth && !oaAuth.apiKey);
+  await cm.disconnect(oa.id);
+
+  // browser-login connection → resolves to a Cookie header.
+  const br = await cm.registerConnection({
+    accountId: 'rt-browser', providerId: 'rt-browser-prov', authType: 'browser-login',
+    displayName: 'RT Browser', cookies: 'session=runtime-cookie',
+  });
+  const brAuth = await cm.resolveRuntimeAuth('rt-browser-prov');
+  record('runtime: browser-login resolves Cookie header', !!brAuth && brAuth.headers.Cookie === 'session=runtime-cookie');
+  await cm.disconnect(br.id);
+
+  // no connection → null (legacy ApiKeyManager fallback path).
+  const none = await cm.resolveRuntimeAuth('rt-nonexistent-prov');
+  record('runtime: no connection resolves null', none === null);
+
+  // secrets are never surfaced through the public account view.
+  record('runtime: api-key masked in publicView', ak.apiKey && ak.apiKey.includes('...'));
+}
+
+// ---------------------------------------------------------------
+// 10. Runtime credential actually used on upstream request
+// ---------------------------------------------------------------
+async function testRuntimeCredentialUpstream() {
+  const services = require('../src/services');
+  const cm = services.connectionManager;
+  const { providerManager, apiKeyManager } = services;
+
+  // Capture the Authorization header the upstream provider received.
+  const seen = [];
+  const mock = http.createServer((rq, rs) => {
+    let b = ''; rq.on('data', (d) => (b += d)); rq.on('end', () => {
+      seen.push({ url: rq.url, auth: rq.headers.authorization, cookie: rq.headers.cookie });
+      rs.writeHead(200, { 'Content-Type': 'application/json' });
+      rs.end(JSON.stringify({
+        id: 'chatcmpl-rt', object: 'chat.completion', created: 1700000000, model: 'rt-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }));
+    });
+  });
+  await new Promise((r) => mock.listen(0, '127.0.0.1', r));
+  const mockPort = mock.address().port;
+
+  // Register a provider whose STATIC key differs from the connection credential.
+  const providers = [{
+    id: 'rt-upstream', name: 'RT Upstream', enabled: true,
+    baseURL: `http://127.0.0.1:${mockPort}`, apiKeys: ['static-provider-key'],
+    supportedModels: ['rt-model'], priority: 1, timeout: 3000,
+  }];
+  providerManager.updateProviders(providers);
+  apiKeyManager.load(providers);
+
+  // Connect an OAuth account for the provider — its token must win over the
+  // static provider key at runtime.
+  const conn = await cm.registerConnection({
+    accountId: 'rt-upstream-oauth', providerId: 'rt-upstream', authType: 'oauth',
+    displayName: 'RT Upstream OAuth', accessToken: 'CONNECTION-TOKEN-999', refreshToken: 'r',
+  });
+
+  const result = await services.requestExecutor.execute({
+    model: 'rt-model',
+    input: { model: 'rt-model', messages: [{ role: 'user', content: 'hi' }] },
+    operation: 'chat',
+    ctx: { requestId: 'rt-test-1' },
+  });
+
+  record('runtime-upstream: request succeeded', result && result.status === 200);
+  const forwarded = seen[0];
+  record('runtime-upstream: connection token used (not static key)',
+    forwarded && forwarded.auth === 'Bearer CONNECTION-TOKEN-999',
+    `auth=${forwarded && forwarded.auth}`);
+  record('runtime-upstream: meta carries connectionId or provider',
+    result && result.meta && result.meta.providerId === 'rt-upstream');
+
+  await cm.disconnect(conn.id);
+  // Restore providers so later HTTP tests are unaffected.
+  providerManager.updateProviders([]);
+  await new Promise((r) => mock.close(r));
+}
+
+// ---------------------------------------------------------------
 // HTTP admin endpoints (new lifecycle + existing)
 // ---------------------------------------------------------------
 let server;
@@ -255,6 +360,8 @@ async function testHttp() {
   await testRefresh();
   await testValidate();
   await testRouting();
+  await testRuntimeAuthResolution();
+  await testRuntimeCredentialUpstream();
 
   await startServer();
   try {

@@ -16,6 +16,8 @@ function openAIErrorMeta(err) {
       return { type: 'invalid_request_error', code: 'invalid_api_key' };
     case 'DISABLED_API_KEY':
       return { type: 'invalid_request_error', code: 'disabled_api_key' };
+    case 'REVOKED_API_KEY':
+      return { type: 'invalid_request_error', code: 'revoked_api_key' };
     case 'EXPIRED_API_KEY':
       return { type: 'invalid_request_error', code: 'expired_api_key' };
     case 'MODEL_FORBIDDEN':

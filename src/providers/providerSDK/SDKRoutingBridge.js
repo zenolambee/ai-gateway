@@ -129,6 +129,7 @@ class SDKRoutingBridge {
       method: opts.method || 'POST',
       body: opts.body,
       headers: opts.headers,
+      auth: opts.auth,
       responseType: opts.responseType,
       timeout: opts.timeout || (provider.timeout || 30000),
     });

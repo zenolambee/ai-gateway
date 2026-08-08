@@ -75,6 +75,28 @@ function createAuthMiddleware({ apiKeyStore, usageTracker } = {}) {
       }
     }
 
+    // Per-key quota pre-flight: reject BEFORE calling any provider when the
+    // key's token quota is already exhausted. This is the cheap, definite
+    // check (used >= limit); fine-grained token accounting is consumed by the
+    // executor after the response. Uses the single official formula in the
+    // store (remaining = limit - used); never recomputed here.
+    if (result.key && typeof apiKeyStore.isQuotaExhausted === 'function'
+      && apiKeyStore.isQuotaExhausted(result.key)) {
+      const q = apiKeyStore.getQuota(result.key.id) || {};
+      return next(new AppError(
+        'API key quota exceeded.',
+        429,
+        {
+          code: 'QUOTA_EXCEEDED',
+          requestId: req.requestId,
+          scope: 'api_key',
+          limit: q.limit,
+          used: q.used,
+          remaining: q.remaining,
+        }
+      ));
+    }
+
     next();
   };
 }

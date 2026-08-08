@@ -265,6 +265,17 @@ const analyticsService = new AnalyticsService({
   metricsCollector,
   alertService,
 });
+// Prompt 24 — official read-only usage & quota analytics reporting layer.
+// Reuses UsageAccountant rollups + ApiKeyStore quota (single source of truth)
+// + Provider/Model registries. No second usage/quota system.
+const UsageAnalyticsService = require('./usageAnalyticsService');
+const usageAnalyticsService = new UsageAnalyticsService({
+  usageAccountant,
+  apiKeyStore,
+  providerManager,
+  modelRegistry,
+  pricingService: null, // late-bound below once pricingService exists
+});
 // Cross-inject alerters so threshold breaches raise alerts.
 budgetService.setAlertService(alertService);
 quotaService.setAlertService(alertService);
@@ -276,6 +287,9 @@ requestExecutor.usageAccountant = usageAccountant;
 requestExecutor.quotaService = quotaService;
 requestExecutor.budgetService = budgetService;
 requestExecutor.analyticsService = analyticsService;
+// Late-bind pricing into the analytics reporter (cost already baked into
+// rollups; this enables future per-report recomputation without a redesign).
+usageAnalyticsService.pricingService = pricingService;
 const chatCompletionsService = new ChatCompletionsService({ requestExecutor });
 const responsesService = new ResponsesService({ requestExecutor });
 const embeddingsService = new EmbeddingsService({ requestExecutor });
@@ -324,6 +338,24 @@ const providerConfigManager = new ProviderConfigManager({
   ruleEngine,
   discovery,
   virtualModelRegistry,
+});
+
+// ---- Prompt 23 — Backup & Restore ----
+// BackupService produces versioned, secret-free snapshots and restores API
+// key metadata / quota policies. Built last so it can read from every
+// registry/service. When BACKUP_DIR is set it can persist/list backup files.
+const BackupService = require('./backupService');
+const backupService = new BackupService({
+  providerManager,
+  apiKeyStore,
+  modelRegistry,
+  quotaService,
+  usageAccountant,
+  virtualModelRegistry,
+  connectionManager,
+}, {
+  backupDir: process.env.BACKUP_DIR || null,
+  gatewayVersion: process.env.VERSION || '1.0.0',
 });
 
 module.exports = {
@@ -391,7 +423,8 @@ module.exports = {
   UsageAccountant,
   analyticsService,
   AnalyticsService,
-  // Sprint 13
+  usageAnalyticsService,
+  UsageAnalyticsService: require('./usageAnalyticsService'),
   policyEngine,
   PolicyEngine,
   policySimulator,
@@ -435,4 +468,8 @@ module.exports = {
   // Connection Manager (centralized unified service)
   connectionManager,
   ConnectionManager: require('./connectionManager'),
+  // Prompt 23 — Backup & Restore + API Key hashing
+  backupService,
+  BackupService: require('./backupService'),
+  ApiKeyHasher: require('./apiKeyHasher'),
 };

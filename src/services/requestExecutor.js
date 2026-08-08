@@ -2,6 +2,46 @@ const logger = require('../utils/logger');
 const AppError = require('../utils/AppError');
 const StreamParser = require('./streamParser');
 const StreamingResponseAdapter = require('./streamingResponseAdapter');
+const { errorCodeToCategory } = require('./apiKeyManager');
+
+/**
+ * Map a gateway/provider error to a stable analytics status category. Reuses
+ * the existing apiKeyManager taxonomy (no second taxonomy) and adds the
+ * gateway-level codes that never reach the provider (quota, auth, validation).
+ * @param {Error} err
+ * @returns {string} one of: authentication_error | rate_limited |
+ *   quota_exceeded | timeout | upstream_error | error
+ */
+function analyticsErrorCategory(err) {
+  const code = (err && err.info && err.info.code) || null;
+  if (!code) return 'error';
+  switch (code) {
+    case 'QUOTA_EXCEEDED':
+    case 'BUDGET_EXCEEDED':
+      return 'quota_exceeded';
+    case 'RATE_LIMIT_EXCEEDED':
+    case 'PROVIDER_RATE_LIMITED':
+      return 'rate_limited';
+    case 'MISSING_API_KEY':
+    case 'INVALID_API_KEY':
+    case 'DISABLED_API_KEY':
+    case 'REVOKED_API_KEY':
+    case 'EXPIRED_API_KEY':
+    case 'PROVIDER_UNAUTHORIZED':
+    case 'PROVIDER_FORBIDDEN':
+    case 'PROVIDER_FORBIDDEN_KEY':
+      return 'authentication_error';
+    default:
+      break;
+  }
+  // Fall back to the shared provider taxonomy.
+  const cat = errorCodeToCategory(code);
+  if (cat === 'TIMEOUT') return 'timeout';
+  if (cat === 'RATE_LIMITED') return 'rate_limited';
+  if (cat === 'UNAUTHORIZED') return 'authentication_error';
+  if (cat === 'SERVER_ERROR' || cat === 'NETWORK_ERROR') return 'upstream_error';
+  return 'error';
+}
 
 /**
  * Default retry policy.
@@ -253,6 +293,35 @@ class RequestExecutor {
   _adapterHeaders(provider) {
     const adapter = this._adapter(provider);
     return adapter.buildHeaders(provider) || {};
+  }
+
+  /**
+   * Resolve runtime authentication for a provider through the official
+   * ConnectionManager. Returns an auth override
+   * ({ connectionId, authType, apiKey, headers }) when a connected account is
+   * available, else null so the HttpClient falls back to the legacy
+   * ApiKeyManager path (full backward compatibility).
+   *
+   * Never logs or exposes secrets — the override is passed straight to the
+   * transport layer.
+   *
+   * @param {object} provider
+   * @param {object} ctx
+   * @returns {Promise<object|null>}
+   * @private
+   */
+  async _resolveConnectionAuth(provider, ctx = {}) {
+    if (!this.connectionManager || typeof this.connectionManager.resolveRuntimeAuth !== 'function') {
+      return null;
+    }
+    try {
+      return await this.connectionManager.resolveRuntimeAuth(provider.id, {
+        strategy: ctx.connectionStrategy,
+        model: ctx.model,
+      });
+    } catch (_) {
+      return null;
+    }
   }
 
   /**
@@ -609,11 +678,15 @@ class RequestExecutor {
         const providerInput = this._resolveModelForProvider(model, input, provider);
         const payload = this._buildPayload(provider, operation, providerInput);
         const headers = this._adapterHeaders(provider);
+        // Resolve runtime auth (endpoint + credential) via the official
+        // ConnectionManager. Null => legacy ApiKeyManager path is used.
+        const connectionAuth = await this._resolveConnectionAuth(provider, { ...ctx, model });
         const attemptCtx = {
           requestId,
           model,
           providerId: provider.id,
           adapterId: this._adapter(provider).__adapterId,
+          connectionId: connectionAuth ? connectionAuth.connectionId : null,
           attempt,
           retryCount,
           fallbackCount,
@@ -631,6 +704,7 @@ class RequestExecutor {
               method: 'POST',
               body: payload,
               headers,
+              auth: connectionAuth,
               responseType: this._responseType(provider, operation, input),
               timeout: this._timeout(provider),
             });
@@ -642,6 +716,7 @@ class RequestExecutor {
                 method: 'POST',
                 body: payload,
                 headers,
+                auth: connectionAuth,
                 responseType: this._responseType(provider, operation, input),
               }
             );
@@ -676,6 +751,17 @@ class RequestExecutor {
             });
           }
 
+          // Atomic per-key quota consume (Prompt 23). When the API key carries
+          // a token quota, advance `used` atomically through the store so
+          // concurrent requests cannot overspend. Best-effort — never blocks a
+          // response that already succeeded. Prefer total tokens; fall back to
+          // counting the request itself when the provider reported no usage.
+          if (this.apiKeyStore && ctx.apiKey && typeof this.apiKeyStore.consumeQuota === 'function'
+            && ctx.apiKey.quota && typeof ctx.apiKey.quota.limit === 'number') {
+            const consumed = totalTokens > 0 ? totalTokens : 1;
+            this.apiKeyStore.consumeQuota(ctx.apiKey.id, consumed).catch(() => {});
+          }
+
           // Sprint 12 — compute cost from pricing (0 when pricing disabled,
           // staying fully backward compatible with the existing $0 reporting).
           const resolvedModelForPricing = (provider.__virtualModelTarget && provider.__virtualModelTarget.model) || model;
@@ -697,6 +783,15 @@ class RequestExecutor {
             this.apiKeyManager.reportSuccess(provider.id, providerResponse._resolvedApiKey, {
               latencyMs: attemptLatencyMs,
               tokens: totalTokens,
+            });
+          }
+
+          // Report per-connection health when this attempt used a
+          // ConnectionManager-resolved credential (for health-aware selection).
+          if (this.connectionManager && connectionAuth && connectionAuth.connectionId) {
+            this.connectionManager.reportResult(connectionAuth.connectionId, {
+              ok: true,
+              latencyMs: attemptLatencyMs,
             });
           }
 
@@ -754,6 +849,8 @@ class RequestExecutor {
                 operation,
                 status: 200,
                 latencyMs: durationMs,
+                stream: false,
+                connectionId: connectionAuth ? connectionAuth.connectionId : null,
                 inputTokens: promptTokens,
                 outputTokens: completionTokens,
                 cachedTokens,
@@ -816,6 +913,13 @@ class RequestExecutor {
         } catch (err) {
           providerError = err;
           const failLatencyMs = Date.now() - attemptStartedAt;
+          if (this.connectionManager && connectionAuth && connectionAuth.connectionId) {
+            this.connectionManager.reportResult(connectionAuth.connectionId, {
+              ok: false,
+              latencyMs: failLatencyMs,
+              error: (err && err.info && err.info.code) || (err && err.message) || 'error',
+            });
+          }
           if (this.metricsCollector) {
             this.metricsCollector.recordFailure({
               providerId: provider.id,
@@ -902,6 +1006,28 @@ class RequestExecutor {
       });
     }
 
+    // Prompt 24 — record the FAILED request in the usage ledger so analytics
+    // can report error rate / error categories per key/provider/model. Uses
+    // the shared error taxonomy; token counts stay 0 (unknown) — never faked.
+    if (this.usageAccountant) {
+      try {
+        this.usageAccountant.recordRequest({
+          requestId,
+          apiKeyId: ctx.apiKey ? ctx.apiKey.id : null,
+          providerId: candidates[candidates.length - 1].id,
+          model,
+          userId: ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null,
+          organizationId: ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null,
+          projectId: ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null,
+          operation,
+          status: (lastError && lastError.statusCode) || 502,
+          latencyMs: durationMs,
+          stream: false,
+          errorCategory: analyticsErrorCategory(lastError),
+        });
+      } catch (_) { /* best-effort */ }
+    }
+
     if (lastError) throw lastError;
     throw new AppError('Request failed for unknown reasons', 502, { requestId });
   }
@@ -978,11 +1104,13 @@ class RequestExecutor {
         const payload = this._buildPayload(provider, operation, input);
         const headers = this._adapterHeaders(provider);
         const adapter = this._adapter(provider);
+        const connectionAuth = await this._resolveConnectionAuth(provider, { ...ctx, model });
         const attemptCtx = {
           requestId,
           model,
           providerId: provider.id,
           adapterId: adapter.__adapterId,
+          connectionId: connectionAuth ? connectionAuth.connectionId : null,
           attempt,
           retryCount,
           fallbackCount,
@@ -997,7 +1125,7 @@ class RequestExecutor {
           const providerResponse = await this.httpClient.streamRequest(
             provider,
             endpoint,
-            { method: 'POST', body: payload, headers }
+            { method: 'POST', body: payload, headers, auth: connectionAuth }
           );
 
           // Stream established — from here on, any error must be surfaced to
@@ -1088,6 +1216,8 @@ class RequestExecutor {
                 operation,
                 status: 200,
                 latencyMs: durationMs,
+                stream: true,
+                connectionId: connectionAuth ? connectionAuth.connectionId : null,
                 inputTokens: streamPrompt,
                 outputTokens: streamCompletion,
                 totalTokens: streamTotal,
@@ -1195,13 +1325,34 @@ class RequestExecutor {
       });
     }
 
+    // Prompt 24 — record the failed stream (pre-stream phase) in the usage
+    // ledger for error-rate analytics.
+    if (this.usageAccountant) {
+      try {
+        this.usageAccountant.recordRequest({
+          requestId,
+          apiKeyId: ctx.apiKey ? ctx.apiKey.id : null,
+          providerId: candidates[candidates.length - 1].id,
+          model,
+          userId: ctx.userId || (ctx.apiKey && ctx.apiKey.userId) || null,
+          organizationId: ctx.organizationId || (ctx.apiKey && ctx.apiKey.organizationId) || null,
+          projectId: ctx.projectId || (ctx.apiKey && ctx.apiKey.projectId) || null,
+          operation,
+          status: (lastError && lastError.statusCode) || 502,
+          latencyMs: durationMs,
+          stream: true,
+          errorCategory: analyticsErrorCategory(lastError),
+        });
+      } catch (_) { /* best-effort */ }
+    }
+
     if (lastError) throw lastError;
     throw new AppError('Request failed for unknown reasons', 502, { requestId });
   }
 
   /**
    * Pipe a provider stream through the parser -> adapter -> writer. Resolves
-   * when the stream ends (including [DONE]) and returns the total bytes written
+   * when the stream ends (including [DONE]) and forwards normalized chunks
    * to the client.
    *
    * @param {object} providerResponse - axios stream response

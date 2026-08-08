@@ -32,6 +32,8 @@ const {
   sdkRoutingBridge,
   accountManager,
   connectionManager,
+  backupService,
+  usageAnalyticsService,
 } = require('../services');
 const { SELECTION_STRATEGIES, validateVirtualModelsConfig } = require('../config/virtualModelsConfig');
 
@@ -249,8 +251,33 @@ router.get('/keys', (req, res) => {
 
 router.post('/keys', async (req, res, next) => {
   try {
-    const { key, name, role, allowedProviders, deniedProviders, allowedModels, deniedModels, expiresAt, description, permissions, rateLimit, quota, metadata, tags, enabled, revoked, usageCount } = req.body;
-    if (!key || typeof key !== 'string') {
+    const { key, name, role, allowedProviders, deniedProviders, allowedModels, deniedModels, expiresAt, description, permissions, rateLimit, quota, metadata, tags, enabled, revoked, usageCount, userId } = req.body;
+
+    // Secure-generation path (Prompt 23): when no explicit `key` is supplied,
+    // generate a cryptographically-secure key, store ONLY its hash + prefix,
+    // and return the plaintext EXACTLY ONCE. When a `key` is supplied the
+    // legacy behaviour is preserved (backward compatible).
+    if (!key) {
+      const { record, rawKey } = await apiKeyStore.generateKey({
+        name: name || `key-${Date.now()}`,
+        role, userId, allowedProviders, deniedProviders, allowedModels, deniedModels,
+        expiresAt, description, permissions, rateLimit, quota, metadata, tags,
+        enabled, status: req.body.status,
+      });
+      if (usageTracker && typeof usageTracker._ensure === 'function') {
+        // no-op ensure; usage is created lazily on first request
+      }
+      // Audit (non-secret): key created.
+      require('../utils/logger').info('API_KEY_CREATED', { id: record.id, keyPrefix: record.keyPrefix, role: record.role });
+      return res.json({
+        success: true,
+        key: apiKeyStore.publicView(record),
+        // One-time plaintext — never returned again, never logged, never stored.
+        apiKey: rawKey,
+      });
+    }
+
+    if (typeof key !== 'string') {
       throw new AppError('A "key" string is required', 400, { code: 'INVALID_REQUEST' });
     }
     if (apiKeyStore.keysByKey.has(key)) {
@@ -261,6 +288,7 @@ router.post('/keys', async (req, res, next) => {
       key,
       name: name || `key-${Date.now()}`,
       role,
+      userId,
       allowedProviders,
       deniedProviders,
       allowedModels,
@@ -277,7 +305,52 @@ router.post('/keys', async (req, res, next) => {
       usageCount,
     });
 
+    require('../utils/logger').info('API_KEY_CREATED', { id: record.id, keyPrefix: record.keyPrefix, role: record.role });
     res.json({ success: true, key: apiKeyStore.publicView(record) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Revoke a key (keeps the record + historical usage; status -> revoked).
+router.post('/keys/:id/revoke', async (req, res, next) => {
+  try {
+    const record = await apiKeyStore.revokeKey(req.params.id);
+    if (!record) {
+      throw new AppError(`Key "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    require('../utils/logger').info('API_KEY_REVOKED', { id: record.id });
+    res.json({ success: true, key: apiKeyStore.publicView(record) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Rotate a key's secret (preserves id, metadata, quota, usage). Returns the
+// new one-time plaintext key.
+router.post('/keys/:id/rotate', async (req, res, next) => {
+  try {
+    const result = await apiKeyStore.rotateKey(req.params.id);
+    if (!result) {
+      throw new AppError(`Key "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    require('../utils/logger').info('API_KEY_ROTATED', { id: result.record.id, keyPrefix: result.record.keyPrefix });
+    res.json({ success: true, key: apiKeyStore.publicView(result.record), apiKey: result.rawKey });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Per-key quota status ({ limit, used, remaining }).
+router.get('/keys/:id/quota', (req, res, next) => {
+  try {
+    const quota = apiKeyStore.getQuota(req.params.id);
+    if (quota === null) {
+      // Key exists but has no quota, or key not found — distinguish.
+      const exists = (apiKeyStore.keys || []).some((k) => k.id === req.params.id);
+      if (!exists) throw new AppError(`Key "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    res.json({ keyId: req.params.id, quota: quota || null });
   } catch (err) {
     next(err);
   }
@@ -326,11 +399,90 @@ router.patch('/keys/:id', async (req, res, next) => {
 
 router.get('/keys/:id/usage', (req, res, next) => {
   try {
+    // Rich analytics view (historical usage + status/stream/latency) plus the
+    // legacy per-key counter for backward compatibility.
+    const analytics = usageAnalyticsService.getApiKeyUsage(req.params.id);
     const usage = usageTracker.getUsage(req.params.id);
-    res.json({ keyId: req.params.id, usage: usage || null });
+    res.json({ keyId: req.params.id, usage: usage || null, analytics: analytics || null });
   } catch (err) {
     next(err);
   }
+});
+
+// Per-key quota analytics ({ limit, used, remaining, percentageUsed,
+// percentageRemaining, resetPeriod, resetAt }) from the single quota source
+// of truth (ApiKeyStore).
+router.get('/keys/:id/quota', (req, res, next) => {
+  try {
+    const quota = usageAnalyticsService.getApiKeyQuota(req.params.id);
+    if (quota === null) {
+      const exists = (apiKeyStore.keys || []).some((k) => k.id === req.params.id);
+      if (!exists) throw new AppError(`Key "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    res.json({ keyId: req.params.id, quota: quota || null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Usage Analytics (Prompt 24) — admin aggregate reporting ---
+
+// Global usage summary (status breakdown + stream split + latency stats).
+router.get('/usage/summary', (req, res, next) => {
+  try {
+    res.json({ summary: usageAnalyticsService.getUsageSummary() });
+  } catch (err) { next(err); }
+});
+
+// Provider usage aggregation (providers from the Provider Registry).
+router.get('/usage/providers', (req, res, next) => {
+  try {
+    res.json({ providers: usageAnalyticsService.getProviderUsage() });
+  } catch (err) { next(err); }
+});
+
+// Model usage aggregation; optional ?providerId= to slice per provider.
+router.get('/usage/models', (req, res, next) => {
+  try {
+    res.json({ models: usageAnalyticsService.getModelUsage({ providerId: req.query.providerId }) });
+  } catch (err) { next(err); }
+});
+
+// Daily usage buckets; optional ?days=N to slice the most recent N days.
+router.get('/usage/daily', (req, res, next) => {
+  try {
+    const days = req.query.days ? parseInt(req.query.days, 10) : undefined;
+    res.json({ daily: usageAnalyticsService.getDailyUsage({ days }) });
+  } catch (err) { next(err); }
+});
+
+// Monthly usage buckets; optional ?months=N.
+router.get('/usage/monthly', (req, res, next) => {
+  try {
+    const months = req.query.months ? parseInt(req.query.months, 10) : undefined;
+    res.json({ monthly: usageAnalyticsService.getMonthlyUsage({ months }) });
+  } catch (err) { next(err); }
+});
+
+// Paginated + filtered raw usage detail (request history, metadata only).
+// Filters: apiKeyId, providerId, model, status(success|error), stream,
+// startDate, endDate (epoch ms). Pagination: page, limit.
+router.get('/usage/detail', (req, res, next) => {
+  try {
+    const q = req.query;
+    const result = usageAnalyticsService.getUsageDetail({
+      apiKeyId: q.apiKeyId,
+      providerId: q.providerId,
+      model: q.model,
+      status: q.status,
+      stream: q.stream === undefined ? undefined : (q.stream === 'true'),
+      startDate: q.startDate ? parseInt(q.startDate, 10) : undefined,
+      endDate: q.endDate ? parseInt(q.endDate, 10) : undefined,
+      page: q.page,
+      limit: q.limit,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
 });
 
 // --- Model Registry (rich — Sprint 10) ---
@@ -1391,8 +1543,7 @@ router.post('/providers/:id/manual-models', async (req, res, next) => {
 });
 
 // Helper: rewrite a single provider config file + reload cascade (no disk reload).
-function updateProviderOnDisk(provider) {
-  const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
+function updateProviderOnDisk(provider) {  const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const toWrite = { ...provider };
   delete toWrite.health;
@@ -1400,5 +1551,71 @@ function updateProviderOnDisk(provider) {
   providerConfigManager.reloadCascade(providerManager.listProviders());
   return { warnings: [] };
 }
+
+// ---- Backup & Restore (Prompt 23) ----
+
+// Create a backup (versioned, secret-free). Returns the backup object; when
+// `?save=true` and a BACKUP_DIR is configured, also persists it to disk.
+router.post('/backup', async (req, res, next) => {
+  try {
+    const backup = await backupService.createBackup({ includeUsage: req.body ? req.body.includeUsage !== false : true });
+    let savedTo = null;
+    if ((req.query.save === 'true' || (req.body && req.body.save === true)) && backupService.backupDir) {
+      savedTo = await backupService.saveBackup(backup, (req.body && req.body.name) || 'backup');
+    }
+    require('../utils/logger').info('BACKUP_CREATED', {
+      backupVersion: backup.backupVersion,
+      savedTo: savedTo ? path.basename(savedTo) : null,
+    });
+    res.json({ success: true, backup, savedTo: savedTo ? path.basename(savedTo) : null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// List persisted backups (metadata only) when a BACKUP_DIR is configured.
+router.get('/backup', (req, res, next) => {
+  try {
+    res.json({ backups: backupService.listBackups() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Validate a backup payload (format, version, schema, integrity) without
+// applying anything.
+router.post('/backup/validate', (req, res, next) => {
+  try {
+    const backup = (req.body && req.body.backup) || req.body;
+    const result = backupService.validateBackup(backup);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Restore a backup. Body: { backup, dryRun?:boolean } OR a stored file via
+// { file, dryRun? }. Validates first; aborts on any validation error.
+router.post('/backup/restore', async (req, res, next) => {
+  try {
+    let backup = (req.body && req.body.backup) || null;
+    if (!backup && req.body && req.body.file) {
+      backup = backupService.loadBackup(req.body.file);
+      if (!backup) throw new AppError(`Backup file "${req.body.file}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    if (!backup) throw new AppError('A "backup" object or "file" name is required', 400, { code: 'INVALID_REQUEST' });
+    const dryRun = !!(req.body && req.body.dryRun);
+    const result = await backupService.restoreBackup(backup, { dryRun });
+    if (!result.ok && !dryRun) {
+      return res.status(400).json({ success: false, ...result });
+    }
+    if (!dryRun) {
+      require('../utils/logger').info('BACKUP_RESTORED', { applied: result.applied });
+    }
+    res.json({ success: result.ok, ...result });
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = router;

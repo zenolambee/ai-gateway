@@ -206,6 +206,7 @@ class ProviderAdapterSDK extends ProviderAdapter {
       method: req.method || 'POST',
       body: req.body,
       headers: req.headers,
+      auth: req.auth,
       timeout: req.timeout || (this.provider.timeout || 30000),
       responseType: req.responseType,
     });

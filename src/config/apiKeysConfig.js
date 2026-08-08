@@ -41,19 +41,25 @@ function normalizeKeyEntry(entry, index) {
 
   if (typeof entry === 'object' && !Array.isArray(entry)) {
     const key = expandEnvVars(entry.key);
-    if (!key) return null;
+    // A record is valid when it carries either a plaintext key OR a keyHash
+    // (hashed-only records created via the secure-generation path).
+    if (!key && !entry.keyHash) return null;
     return {
-      id: entry.id || key,
-      key,
+      id: entry.id || key || (entry.keyHash ? `key_${String(entry.keyHash).slice(0, 16)}` : undefined),
+      key: key || undefined,
+      keyHash: entry.keyHash,
+      keyPrefix: entry.keyPrefix,
       name: entry.name || `key-${index}`,
-      status: entry.status === 'inactive' ? 'inactive' : 'active',
+      status: entry.status === 'inactive' ? 'inactive' : (entry.status === 'revoked' ? 'revoked' : 'active'),
       role: entry.role === 'admin' ? 'admin' : 'user',
+      userId: entry.userId,
       expiresAt: typeof entry.expiresAt === 'number' ? entry.expiresAt : undefined,
       allowedProviders: Array.isArray(entry.allowedProviders) ? entry.allowedProviders : undefined,
       allowedModels: Array.isArray(entry.allowedModels) ? entry.allowedModels : undefined,
       createdAt: typeof entry.createdAt === 'number' ? entry.createdAt : Math.floor(Date.now() / 1000),
       description: entry.description,
       updatedAt: typeof entry.updatedAt === 'number' ? entry.updatedAt : undefined,
+      revokedAt: typeof entry.revokedAt === 'number' ? entry.revokedAt : undefined,
       enabled: typeof entry.enabled === 'boolean' ? entry.enabled : undefined,
       revoked: typeof entry.revoked === 'boolean' ? entry.revoked : undefined,
       lastUsed: typeof entry.lastUsed === 'number' ? entry.lastUsed : undefined,

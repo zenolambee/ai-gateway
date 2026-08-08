@@ -64,7 +64,7 @@ class HttpClient {
    * @returns {object}
    * @private
    */
-  _buildHeaders(provider, apiKey, extraHeaders = {}) {
+  _buildHeaders(provider, apiKey, extraHeaders = {}, authHeaders = null) {
     const headers = {
       'Content-Type': 'application/json',
       Accept: 'application/json',
@@ -79,6 +79,13 @@ class HttpClient {
     }
 
     Object.assign(headers, extraHeaders || {});
+
+    // Connection-resolved auth headers (OAuth/device-code/session/browser)
+    // take precedence over the static provider key so a Connect-Account
+    // credential always wins at runtime.
+    if (authHeaders && typeof authHeaders === 'object') {
+      Object.assign(headers, authHeaders);
+    }
 
     return headers;
   }
@@ -247,8 +254,21 @@ class HttpClient {
     const url = this._buildUrl(provider, endpoint);
     const timeout = payload.timeout || provider.timeout || 30000;
 
-    const apiKey = this._resolveApiKey(provider);
-    const headers = this._buildHeaders(provider, apiKey, payload.headers);
+    // Connection-resolved auth (ConnectionManager) takes precedence. When an
+    // `auth` override supplies a credential (apiKey or header-based auth such
+    // as OAuth/session/cookies), we use it and do NOT fall back to the legacy
+    // ApiKeyManager — this lets header-only providers (no static keys) work.
+    // Otherwise we resolve/rotate a provider key via the ApiKeyManager (full
+    // backward compatibility).
+    const auth = payload.auth || null;
+    const authHasHeaders = !!(auth && auth.headers && Object.keys(auth.headers).length > 0);
+    let apiKey = null;
+    if (auth && auth.apiKey) {
+      apiKey = auth.apiKey;
+    } else if (!authHasHeaders) {
+      apiKey = this._resolveApiKey(provider);
+    }
+    const headers = this._buildHeaders(provider, apiKey, payload.headers, auth && auth.headers);
     const hasBody = payload.body !== undefined && payload.body !== null;
     const isForm = hasBody && this._isFormData(payload.body);
 
@@ -468,8 +488,15 @@ class HttpClient {
     const method = (payload.method || 'POST').toUpperCase();
     const url = this._buildUrl(provider, endpoint);
     const timeout = provider.timeout || 30000;
-    const apiKey = this._resolveApiKey(provider);
-    const headers = this._buildHeaders(provider, apiKey, payload.headers);
+    const auth = payload.auth || null;
+    const authHasHeaders = !!(auth && auth.headers && Object.keys(auth.headers).length > 0);
+    let apiKey = null;
+    if (auth && auth.apiKey) {
+      apiKey = auth.apiKey;
+    } else if (!authHasHeaders) {
+      apiKey = this._resolveApiKey(provider);
+    }
+    const headers = this._buildHeaders(provider, apiKey, payload.headers, auth && auth.headers);
     headers.Accept = 'text/event-stream';
 
     const logCtx = {

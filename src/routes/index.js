@@ -12,6 +12,7 @@ const embeddingsRoute = require('./embeddings');
 const imagesRoute = require('./images');
 const audioRoute = require('./audio');
 const metricsRoute = require('./metrics');
+const usageRoute = require('./usage');
 
 router.use('/', rootRoute);
 router.use('/health', healthRoute);
@@ -27,5 +28,6 @@ router.use('/v1/responses', responsesRoute);
 router.use('/v1/embeddings', embeddingsRoute);
 router.use('/v1/images', imagesRoute);
 router.use('/v1/audio', audioRoute);
+router.use('/v1/usage', usageRoute);
 
 module.exports = router;

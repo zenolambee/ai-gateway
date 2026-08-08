@@ -44,7 +44,15 @@ function _ensureKey(map, key, factory) {
 }
 
 function aggCounters() {
-  return { requests: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0, totalTokens: 0, cost: 0 };
+  return {
+    requests: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0, totalTokens: 0, cost: 0,
+    // Prompt 24 — status / stream / latency analytics (additive; all default 0
+    // so existing serialized snapshots load unchanged).
+    successes: 0, failures: 0,
+    streamRequests: 0, nonStreamRequests: 0,
+    latencySum: 0, latencyCount: 0, latencyMin: null, latencyMax: null,
+    errorsByCategory: {},
+  };
 }
 
 class UsageAccountant {
@@ -142,6 +150,10 @@ class UsageAccountant {
       operation: args.operation || null,
       status: args.status || 200,
       latencyMs: typeof args.latencyMs === 'number' ? args.latencyMs : null,
+      // Prompt 24 — additive analytics dimensions.
+      stream: args.stream === true,
+      errorCategory: args.errorCategory || null,
+      connectionId: args.connectionId || null,
       inputTokens: args.inputTokens || 0,
       outputTokens: args.outputTokens || 0,
       cachedTokens: args.cachedTokens || 0,
@@ -180,6 +192,28 @@ class UsageAccountant {
     c.reasoningTokens += entry.reasoningTokens;
     c.totalTokens += entry.totalTokens;
     c.cost = Math.round((c.cost + entry.cost) * 1e8) / 1e8;
+
+    // Prompt 24 — status / stream / latency / error-category rollups. Guarded
+    // with defaults so counters loaded from an older on-disk snapshot (which
+    // lack these fields) are upgraded lazily on the next bump.
+    const isSuccess = typeof entry.status === 'number' ? entry.status < 400 : true;
+    if (isSuccess) c.successes = (c.successes || 0) + 1;
+    else c.failures = (c.failures || 0) + 1;
+
+    if (entry.stream) c.streamRequests = (c.streamRequests || 0) + 1;
+    else c.nonStreamRequests = (c.nonStreamRequests || 0) + 1;
+
+    if (typeof entry.latencyMs === 'number') {
+      c.latencySum = (c.latencySum || 0) + entry.latencyMs;
+      c.latencyCount = (c.latencyCount || 0) + 1;
+      c.latencyMin = (c.latencyMin == null) ? entry.latencyMs : Math.min(c.latencyMin, entry.latencyMs);
+      c.latencyMax = (c.latencyMax == null) ? entry.latencyMs : Math.max(c.latencyMax, entry.latencyMs);
+    }
+
+    if (entry.errorCategory) {
+      if (!c.errorsByCategory) c.errorsByCategory = {};
+      c.errorsByCategory[entry.errorCategory] = (c.errorsByCategory[entry.errorCategory] || 0) + 1;
+    }
   }
 
   _scheduleFlush() {
