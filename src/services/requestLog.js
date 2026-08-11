@@ -47,6 +47,12 @@ class RequestLog {
       latencyMs: detail.latencyMs || 0,
       operation: detail.operation || null,
       error: detail.error || null,
+      // Routing metadata (never carries secrets): which connection served
+      // the request and which strategy picked it. Drives the dashboard's
+      // "Recent Routing" panel.
+      connectionId: detail.connectionId || null,
+      connectionName: detail.connectionName || null,
+      strategy: detail.strategy || null,
       timestamp: detail.timestamp || Date.now(),
       seq: this._offset,
     };

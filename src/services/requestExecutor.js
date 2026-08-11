@@ -315,9 +315,17 @@ class RequestExecutor {
       return null;
     }
     try {
+      // Model-based routing rules can restrict the eligible connection set
+      // (allow-list). The ModelRouter owns the rule state (late-bound).
+      let connectionIds;
+      if (ctx.model && this.modelRouter && typeof this.modelRouter.connectionAllowList === 'function') {
+        const allow = this.modelRouter.connectionAllowList(ctx.model);
+        if (allow) connectionIds = allow;
+      }
       return await this.connectionManager.resolveRuntimeAuth(provider.id, {
         strategy: ctx.connectionStrategy,
         model: ctx.model,
+        connectionIds,
       });
     } catch (_) {
       return null;
@@ -575,6 +583,22 @@ class RequestExecutor {
       requiredCapability
     );
 
+    // Enforce per-key MODEL restriction at the executor chokepoint too. The
+    // auth middleware only sees `req.body.model` (JSON requests); multipart
+    // endpoints (audio/images) carry the model in a form field parsed AFTER
+    // auth, so the middleware cannot enforce it there. Enforcing here closes
+    // that gap for every operation. Uses the same store predicate (no second
+    // permission system).
+    if (ctx.apiKey && this.apiKeyStore
+      && typeof this.apiKeyStore.canAccessModel === 'function'
+      && !this.apiKeyStore.canAccessModel(ctx.apiKey, model)) {
+      throw new AppError(
+        `This API key is not allowed to access model "${model}".`,
+        403,
+        { code: 'MODEL_FORBIDDEN', requestId, model }
+      );
+    }
+
     // Enforce per-key provider restrictions: when the request carries an
     // API key with an allowedProviders list, filter out providers the key
     // is not permitted to use.
@@ -824,6 +848,11 @@ class RequestExecutor {
               status: 200,
               latencyMs: durationMs,
               operation,
+              connectionId: connectionAuth ? connectionAuth.connectionId : null,
+              connectionName: connectionAuth ? connectionAuth.connectionName : null,
+              strategy: (connectionAuth && connectionAuth.strategy)
+                || (this.modelRouter && typeof this.modelRouter.getStrategy === 'function'
+                  ? this.modelRouter.getStrategy() : null),
             });
           }
 
@@ -1003,6 +1032,8 @@ class RequestExecutor {
         latencyMs: durationMs,
         operation,
         error: lastError ? lastError.message : 'Request failed',
+        strategy: this.modelRouter && typeof this.modelRouter.getStrategy === 'function'
+          ? this.modelRouter.getStrategy() : null,
       });
     }
 
@@ -1063,6 +1094,36 @@ class RequestExecutor {
       requiredCapability
     );
 
+    // Enforce per-key MODEL restriction (mirrors execute()); multipart and
+    // JSON streaming both flow through here.
+    if (ctx.apiKey && this.apiKeyStore
+      && typeof this.apiKeyStore.canAccessModel === 'function'
+      && !this.apiKeyStore.canAccessModel(ctx.apiKey, model)) {
+      throw new AppError(
+        `This API key is not allowed to access model "${model}".`,
+        403,
+        { code: 'MODEL_FORBIDDEN', requestId, model }
+      );
+    }
+
+    // Enforce per-key provider restrictions BEFORE any upstream call. This
+    // mirrors the non-streaming execute() path so streaming can never bypass
+    // provider permission (including on failover, since the whole candidate
+    // pool is pre-filtered here). Fixes the streaming permission-bypass gap.
+    if (ctx.apiKey && this.apiKeyStore) {
+      const restricted = candidates.filter(
+        (p) => this.apiKeyStore.canAccessProvider(ctx.apiKey, p.id)
+      );
+      if (restricted.length === 0 && candidates.length > 0) {
+        throw new AppError(
+          `This API key is not allowed to access any provider serving model "${model}".`,
+          403,
+          { code: 'PROVIDER_FORBIDDEN', requestId, model }
+        );
+      }
+      candidates = restricted;
+    }
+
     // Filter out providers whose circuit breaker is open (health monitor).
     if (this.healthMonitor) {
       candidates = candidates.filter((p) => this.healthMonitor.isAvailable(p.id));
@@ -1101,7 +1162,10 @@ class RequestExecutor {
         }
 
         const endpoint = this._endpoint(provider, operation);
-        const payload = this._buildPayload(provider, operation, input);
+        // Resolve the alias to the canonical model id the provider expects
+        // (mirrors the non-streaming execute() path).
+        const providerInput = this._resolveModelForProvider(model, input, provider);
+        const payload = this._buildPayload(provider, operation, providerInput);
         const headers = this._adapterHeaders(provider);
         const adapter = this._adapter(provider);
         const connectionAuth = await this._resolveConnectionAuth(provider, { ...ctx, model });

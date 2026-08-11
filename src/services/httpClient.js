@@ -320,6 +320,12 @@ class HttpClient {
           const text = errorData.toString('utf8');
           try { errorData = JSON.parse(text); } catch { errorData = text; }
         }
+        if (process.env.DEBUG_STREAM && axiosConfig.responseType === 'stream') {
+          logger.info('streamRequest error body', {
+            status: res.status,
+            raw: String(errorData || '').slice(0, 600),
+          });
+        }
         const error = {
           response: { ...res, data: errorData },
           config: axiosConfig,
@@ -498,6 +504,20 @@ class HttpClient {
     }
     const headers = this._buildHeaders(provider, apiKey, payload.headers, auth && auth.headers);
     headers.Accept = 'text/event-stream';
+
+    if (process.env.DEBUG_STREAM) {
+      logger.info('streamRequest debug', {
+        providerId: provider.id,
+        url,
+        authHeader: (headers.Authorization || '').slice(0, 40),
+        body: JSON.stringify(payload.body || '').slice(0, 800),
+      });
+    }
+    if (process.env.DEBUG_RESP_BODY) {
+      res.on('data', (d) => {
+        if (d.length) logger.info('streamResp body', { chunk: d.toString().slice(0, 500) });
+      });
+    }
 
     const logCtx = {
       providerId: provider.id,

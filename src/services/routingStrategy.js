@@ -173,18 +173,26 @@ function lowestLatencyStrategy(candidates, ctx = {}) {
 /**
  * Round-robin: rotate the start of the candidate list per model. Uses
  * `ctx.cursors[model].lastIdx` to remember the rotation offset.
+ *
+ * The rotation is anchored to the stable PRIORITY-ordered candidate list,
+ * so with candidates [A,B,C] the visit sequence is A → B → C → A → B → C
+ * regardless of the order the caller passed them in. The cursor stores the
+ * NEXT start offset; each call consumes it and advances by one, which makes
+ * concurrent requests rotate correctly (Node's single-threaded event loop
+ * guarantees the read-advance-write is atomic within a tick — no interleaving
+ * between the read of `lastIdx` and the write).
  */
 function roundRobinStrategy(candidates, ctx = {}) {
   if (candidates.length <= 1) return [...candidates];
   const model = ctx.model || '__default__';
   const cursors = ctx.cursors || {};
   const c = cursors[model] || { lastIdx: 0 };
-  const start = ((c.lastIdx % candidates.length) + candidates.length) % candidates.length;
-  // advance cursor for next call
-  c.lastIdx = (start + 1) % candidates.length;
-  cursors[model] = c;
-  // Rotate the list: stable priority order first, then rotate by `start`.
+  // Rotate the stable priority-ordered list by the current offset.
   const sorted = priorityStrategy([...candidates]);
+  const start = ((c.lastIdx % sorted.length) + sorted.length) % sorted.length;
+  // Advance the cursor for the NEXT call before returning.
+  c.lastIdx = (start + 1) % sorted.length;
+  cursors[model] = c;
   return sorted.slice(start).concat(sorted.slice(0, start));
 }
 

@@ -30,8 +30,12 @@ class AccountManager {
     this.registry = opts.registry || null;
     this.providerManager = opts.providerManager || null;
     this.httpClient = opts.httpClient || null;
-    // Per-provider account selection cursors for round-robin
-    this._cursors = new Map(); // providerId -> { lastIdx, strategy }
+    // Global default connection selection strategy (config/routing.json
+    // `connectionStrategy`). Per-provider overrides live in this._cursors.
+    this.defaultStrategy = typeof opts.defaultStrategy === 'string' ? opts.defaultStrategy : 'priority';
+    // Per-provider account selection cursors for round-robin + the
+    // per-provider strategy override: providerId -> { lastAccountId, strategy }
+    this._cursors = new Map();
     // Account health tracking
     this._health = new Map(); // accountId -> { latency, successCount, failureCount, lastError, lastUsed }
     // Raw account cache (enhanced fields preserved)
@@ -97,10 +101,30 @@ class AccountManager {
       if (raw && raw.credential) {
         enhanced.credential = raw.credential;
       }
-      await this.registry._saveAccount(enhanced, enhanced.authType);
+      // SECURITY: never persist plaintext secrets at the account top level —
+      // the credential object is encrypted by _saveAccount, but stray plain
+      // fields (apiKey/accessToken/refreshToken/sessionToken/cookies) would
+      // otherwise be written to storage verbatim. The in-memory enhanced copy
+      // keeps the key so publicView() can render a masked preview.
+      const toPersist = { ...enhanced };
+      for (const secretField of ['apiKey', 'accessToken', 'refreshToken', 'sessionToken', 'cookies', 'deviceCode']) {
+        delete toPersist[secretField];
+      }
+      await this.registry._saveAccount(toPersist, enhanced.authType);
     }
     this._accounts.set(id, enhanced);
     return this.publicView(enhanced);
+  }
+
+  /**
+   * Remove an account from the enhanced in-memory index. Called when a
+   * connection is disconnected through the ConnectionManager/registry so
+   * selection strategies never see stale entries.
+   * @param {string} accountId
+   */
+  removeAccount(accountId) {
+    this._accounts.delete(accountId);
+    this._health.delete(accountId);
   }
 
   /**
@@ -148,6 +172,28 @@ class AccountManager {
    * @returns {Promise<Array<object>>}
    */
   async listAccounts(providerId) {
+    // Reconcile with the registry (source of truth) so connections created
+    // via ConnectionRegistry.connect() or removed via disconnect() are
+    // reflected here without duplicating storage. The registry reconciles
+    // its own map against storage first.
+    if (this.registry && this.registry.accounts) {
+      if (typeof this.registry.listAccounts === 'function') {
+        try { await this.registry.listAccounts(); } catch (_) { /* keep view */ }
+      }
+      for (const [accountId, raw] of this.registry.accounts) {
+        if (!this._accounts.has(accountId)) {
+          this._accounts.set(accountId, {
+            ...raw,
+            enabled: raw.enabled !== false,
+            priority: typeof raw.priority === 'number' ? raw.priority : 100,
+            weight: typeof raw.weight === 'number' && raw.weight > 0 ? raw.weight : 1,
+          });
+        }
+      }
+      for (const accountId of [...this._accounts.keys()]) {
+        if (!this.registry.accounts.has(accountId)) this._accounts.delete(accountId);
+      }
+    }
     const values = [...this._accounts.values()];
     const filtered = providerId ? values.filter((a) => a.providerId === providerId) : values;
     return filtered.map((a) => this.publicView(a));
@@ -213,54 +259,103 @@ class AccountManager {
 
   /**
    * Select the next best account for a provider given a strategy.
+   *
+   * The effective strategy is resolved from: the explicit `opts.strategy`
+   * (per-request override) → the strategy configured for this provider via
+   * the admin routing API (stored in this._cursors[providerId].strategy) →
+   * the global default connection strategy (this.defaultStrategy, from
+   * config/routing.json `connectionStrategy`) → 'priority'.
+   *
    * @param {string} providerId
    * @param {object} [opts]
-   * @param {string} [opts.strategy='priority'] - priority|fastest|weighted|round-robin|least-used|random
+   * @param {string} [opts.strategy] - per-request strategy override
    * @param {string} [opts.model] - context for strategy
    * @returns {Promise<object|null>} selected account (public view)
    */
   async selectAccount(providerId, opts = {}) {
     const accounts = await this.getAvailableAccounts(providerId);
     if (accounts.length === 0) return null;
-    const strategy = opts.strategy || 'priority';
+    const configured = this._cursors.get(providerId);
+    const strategy = opts.strategy
+      || (configured && configured.strategy)
+      || this.defaultStrategy
+      || 'priority';
     let selected;
 
     switch (strategy) {
-      case 'fastest': {
-        // Lowest latency first.
+      case 'fastest':
+      case 'fastest-response':
+      case 'lowest-latency': {
+        // Lowest latency first. Accounts with no recorded latency are
+        // preferred over known-slow accounts but lose to known-fast ones.
         const scored = accounts.map((a) => ({
           account: a,
-          latency: this._health.get(a.id)?.lastLatencyMs || Infinity,
+          latency: this._health.get(a.accountId || a.id)?.lastLatencyMs,
         }));
-        scored.sort((a, b) => a.latency - b.latency);
-        selected = scored[0].account;
+        const known = scored.filter((s) => typeof s.latency === 'number');
+        if (known.length === 0) {
+          // No latency data yet — safe fallback to priority order.
+          selected = accounts[0];
+        } else {
+          scored.sort((a, b) => {
+            const la = typeof a.latency === 'number' ? a.latency : Infinity;
+            const lb = typeof b.latency === 'number' ? b.latency : Infinity;
+            return la - lb;
+          });
+          selected = scored[0].account;
+        }
         break;
       }
       case 'weighted': {
-        // Weighted random selection.
-        const total = accounts.reduce((s, a) => s + (a.weight || 1), 0);
+        // Weighted random selection. Connections with weight 0 never win
+        // unless every connection has weight 0 (then all share weight 1).
+        const rawWeights = accounts.map((a) => (typeof a.weight === 'number' && a.weight > 0 ? a.weight : 0));
+        const anyPositive = rawWeights.some((w) => w > 0);
+        const weights = anyPositive ? rawWeights : accounts.map(() => 1);
+        const total = weights.reduce((s, w) => s + w, 0);
         let r = Math.random() * total;
-        for (const a of accounts) {
-          r -= a.weight || 1;
-          if (r <= 0) { selected = a; break; }
+        for (let i = 0; i < accounts.length; i += 1) {
+          r -= weights[i];
+          if (r < 0) { selected = accounts[i]; break; }
         }
         if (!selected) selected = accounts[accounts.length - 1];
         break;
       }
       case 'round-robin': {
-        const cursor = this._cursors.get(providerId) || { lastIdx: -1 };
-        cursor.lastIdx = (cursor.lastIdx + 1) % accounts.length;
+        // Stateful round-robin anchored on the ACCOUNT IDENTITY, not the
+        // list position. The cursor remembers the last served account id, so
+        // when a connection is disabled the remaining connections keep their
+        // stable rotation (A(disabled B)C → A → C → A → C) instead of
+        // re-serving the head of the shrunken list.
+        //
+        // Concurrency: the cursor read + advance + write happen in the same
+        // synchronous block; Node's event loop cannot interleave another
+        // request between them, so concurrent requests rotate correctly.
+        const cursor = this._cursors.get(providerId) || { lastAccountId: null };
+        const lastId = cursor.lastAccountId || cursor.lastId || null;
+        let startIdx = 0;
+        if (lastId) {
+          const found = accounts.findIndex((a) => (a.accountId || a.id) === lastId);
+          if (found !== -1) startIdx = (found + 1) % accounts.length;
+        }
+        selected = accounts[startIdx];
+        cursor.lastAccountId = selected.accountId || selected.id;
+        delete cursor.lastIdx; // legacy field — superseded by lastAccountId
         this._cursors.set(providerId, cursor);
-        selected = accounts[cursor.lastIdx];
         break;
       }
       case 'least-used': {
-        // Lowest usage count first.
-        const scored = accounts.map((a) => ({
-          account: a,
-          used: this._health.get(a.id)?.successCount || 0,
-        }));
-        scored.sort((a, b) => a.used - b.used);
+        // Lowest usage count first (successCount + failureCount from the
+        // existing health tracking — no new metrics system).
+        const scored = accounts.map((a) => {
+          const h = this._health.get(a.accountId || a.id);
+          const used = h ? (h.successCount || 0) + (h.failureCount || 0) : 0;
+          return { account: a, used };
+        });
+        scored.sort((a, b) => {
+          if (a.used !== b.used) return a.used - b.used;
+          return (a.account.priority || 100) - (b.account.priority || 100);
+        });
         selected = scored[0].account;
         break;
       }
@@ -270,7 +365,7 @@ class AccountManager {
       }
       case 'priority':
       default: {
-        // Already sorted by priority.
+        // Already sorted by priority (stable) — lowest value first.
         selected = accounts[0];
         break;
       }
@@ -330,6 +425,54 @@ class AccountManager {
           ? Math.round((h.successCount / (h.successCount + h.failureCount)) * 10000) / 100
           : 100,
       };
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------
+  // Routing configuration (admin API / hot reload)
+  // ---------------------------------------------------------------
+
+  /**
+   * Set the global default connection selection strategy.
+   * @param {string} strategyId
+   */
+  setDefaultStrategy(strategyId) {
+    if (typeof strategyId === 'string' && strategyId) this.defaultStrategy = strategyId;
+  }
+
+  /**
+   * Get the effective connection selection strategy for a provider
+   * (per-provider override → global default).
+   * @param {string} providerId
+   * @returns {string}
+   */
+  getStrategy(providerId) {
+    const cfg = this._cursors.get(providerId);
+    return (cfg && cfg.strategy) || this.defaultStrategy || 'priority';
+  }
+
+  /**
+   * Set (or clear) the per-provider connection selection strategy.
+   * @param {string} providerId
+   * @param {string|null} strategyId - null clears the override
+   */
+  setProviderStrategy(providerId, strategyId) {
+    if (!providerId) return;
+    const cur = this._cursors.get(providerId) || {};
+    if (strategyId === null || strategyId === undefined) delete cur.strategy;
+    else cur.strategy = strategyId;
+    this._cursors.set(providerId, cur);
+  }
+
+  /**
+   * Return per-provider strategy overrides for the admin API.
+   * @returns {object} providerId -> strategyId
+   */
+  getProviderStrategies() {
+    const out = {};
+    for (const [pid, cfg] of this._cursors) {
+      if (cfg && cfg.strategy) out[pid] = cfg.strategy;
     }
     return out;
   }

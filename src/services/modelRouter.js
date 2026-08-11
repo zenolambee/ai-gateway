@@ -37,6 +37,10 @@ class ModelRouter {
     this.virtualModelRegistry = opts.virtualModelRegistry || null;
     // Per-model routing overrides: { [modelId]: { strategy, providerOrder } }
     this._modelOverrides = {};
+    // Model-based routing rules (Dashboard-managed): ruleId -> rule object.
+    // Rules are also folded into _modelOverrides for the strategy/provider
+    // ordering; the full rule records live here for the admin API.
+    this._modelRules = new Map();
     this.strategy = this.defaultStrategy;
     // Per-model round-robin cursors (used by the round-robin routing strategy)
     this._cursors = {};
@@ -45,6 +49,11 @@ class ModelRouter {
     // Capability store for legacy providers: providerId -> capability object.
     // Populated by discovery/health so capability routing works for legacy too.
     this._legacyCapabilities = {};
+    // Late-bound ConnectionManager (composition root) — used by model rules
+    // to restrict the eligible connection set per model.
+    this.connectionManager = null;
+    // Keep direct (non-rule) overrides separate so rules can overlay them.
+    this._directModelOverrides = {};
   }
 
   /**
@@ -98,7 +107,9 @@ class ModelRouter {
    * @param {object} overrides - { [modelId]: { strategy?: string, providerOrder?: string[] } }
    */
   setModelOverrides(overrides) {
-    this._modelOverrides = overrides && typeof overrides === 'object' ? overrides : {};
+    this._directModelOverrides = overrides && typeof overrides === 'object' ? overrides : {};
+    // Keep any active model rules on top of the direct overrides.
+    this._syncModelRuleOverrides();
   }
 
   /**
@@ -321,6 +332,121 @@ class ModelRouter {
    * @param {object} mgr
    */
   setApiKeyManager(mgr) { this.apiKeyManager = mgr; }
+
+  // ---------------------------------------------------------------
+  // Model-based routing rules (Dashboard-managed)
+  //
+  // A model rule binds a model id to a routing strategy, an optional
+  // explicit provider order, and an optional connection allow-list. Rules
+  // are translated into the existing per-model override mechanism — no
+  // separate router. Connection allow-lists are surfaced to the
+  // RequestExecutor via `_connectionAllowList(model)` and enforced when
+  // the ConnectionManager resolves the runtime credential.
+  // ---------------------------------------------------------------
+
+  /**
+   * Replace the full model-rule set (id -> rule). Each rule:
+   *   { id, model, strategy?, providerOrder?, connectionIds?, enabled? }
+   * Disabled rules are dropped from the active overrides.
+   * @param {Array<object>} rules
+   */
+  setModelRules(rules) {
+    this._modelRules = new Map();
+    const list = Array.isArray(rules) ? rules : [];
+    for (const r of list) {
+      if (r && typeof r.id === 'string' && r.id && typeof r.model === 'string' && r.model) {
+        this._modelRules.set(r.id, {
+          id: r.id,
+          model: r.model,
+          strategy: typeof r.strategy === 'string' ? r.strategy : undefined,
+          providerOrder: Array.isArray(r.providerOrder) ? [...r.providerOrder] : undefined,
+          connectionIds: Array.isArray(r.connectionIds) ? [...r.connectionIds] : undefined,
+          enabled: r.enabled !== false,
+        });
+      }
+    }
+    this._syncModelRuleOverrides();
+  }
+
+  /**
+   * Add or update a single model rule.
+   * @param {object} rule
+   */
+  setModelRule(rule) {
+    if (!rule || typeof rule.id !== 'string' || !rule.id) return false;
+    if (typeof rule.model !== 'string' || !rule.model) return false;
+    this._modelRules.set(rule.id, {
+      id: rule.id,
+      model: rule.model,
+      strategy: typeof rule.strategy === 'string' ? rule.strategy : undefined,
+      providerOrder: Array.isArray(rule.providerOrder) ? [...rule.providerOrder] : undefined,
+      connectionIds: Array.isArray(rule.connectionIds) ? [...rule.connectionIds] : undefined,
+      enabled: rule.enabled !== false,
+    });
+    this._syncModelRuleOverrides();
+    return true;
+  }
+
+  /**
+   * Remove a model rule by id.
+   * @param {string} id
+   * @returns {boolean}
+   */
+  removeModelRule(id) {
+    const ok = this._modelRules.delete(id);
+    if (ok) this._syncModelRuleOverrides();
+    return ok;
+  }
+
+  /**
+   * Return all model rules (for the admin API).
+   * @returns {Array<object>}
+   */
+  listModelRules() {
+    return [...this._modelRules.values()].map((r) => ({ ...r }));
+  }
+
+  /**
+   * Return the connection allow-list for a model (union of all enabled
+   * rules targeting the model that declare a connectionIds list), or null
+   * when no rule restricts connections.
+   * @param {string} model
+   * @returns {string[]|null}
+   */
+  connectionAllowList(model) {
+    if (!model) return null;
+    const allowed = new Set();
+    let restricted = false;
+    for (const r of this._modelRules.values()) {
+      if (r.enabled === false || r.model !== model) continue;
+      if (Array.isArray(r.connectionIds)) {
+        restricted = true;
+        for (const c of r.connectionIds) allowed.add(c);
+      }
+    }
+    return restricted ? [...allowed] : null;
+  }
+
+  /**
+   * Fold the enabled model rules into the per-model override map consumed
+   * by getCandidateProviders(). Rules take precedence over any overrides
+   * set directly via setModelOverrides for the same model — but direct
+   * overrides for models without rules are preserved.
+   * @private
+   */
+  _syncModelRuleOverrides() {
+    // Start from the direct overrides (setModelOverrides) and overlay rules.
+    const base = this._directModelOverrides || {};
+    const merged = { ...base };
+    for (const r of this._modelRules.values()) {
+      if (r.enabled === false) continue;
+      const entry = {};
+      if (r.strategy) entry.strategy = r.strategy;
+      if (Array.isArray(r.providerOrder) && r.providerOrder.length > 0) entry.providerOrder = [...r.providerOrder];
+      if (Object.keys(entry).length > 0) merged[r.model] = entry;
+    }
+    this._modelOverrides = merged;
+  }
 }
 
 module.exports = ModelRouter;

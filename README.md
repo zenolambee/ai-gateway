@@ -63,11 +63,21 @@ Edit the `.env` file with your preferred settings:
 - `PORT` – The port the server will listen on (default `3000`).
 - `NODE_ENV` – Environment (`development`, `production`, or `test`). Affects morgan log format and other behaviors.
 - `VERSION` – Version string returned in the health‑check response.
-- `MODELS_LIST` – A JSON array of model objects returned by the `/v1/models` endpoint. Each object must have at least `id` and `object` fields.
-- `AI_API_URL` – The URL of the AI provider's chat completions endpoint (OpenAI‑compatible).
-- `AI_API_KEY` – Your API key for the AI provider. **The server will fail to start if this is not set.**
-- `AI_MODEL` – Default model identifier used when no model is provided in a generation request.
+- `GATEWAY_SECRET_KEY` – **(Recommended for production, optional)** Gateway master secret used by the `EncryptionService` to encrypt provider credentials at rest. This is a *Gateway* secret, **not** a provider API key. When unset, a process-local key is generated (credentials will not survive a restart).
 - `PROVIDERS_CONFIG_DIR` – Directory containing provider JSON config files (defaults to `config/providers`).
+
+**Provider credentials are optional at startup.** The Gateway starts with **zero** provider API keys configured. Provider credentials (NVIDIA/OpenAI/Anthropic/… API keys, OAuth tokens, etc.) are configured through the Dashboard / ConnectionManager and are encrypted at rest, or supplied optionally via `${VAR}` placeholders in provider config files. If a credential is missing, that provider is auto-disabled at startup and requests routed to it return a clean `provider_not_configured` error — the process never aborts.
+
+### Legacy `/api/v1/generate` (optional, deprecated)
+
+The following variables only affect the legacy single-provider demo endpoint `POST /api/v1/generate`. They are **optional** and are **not required for startup**:
+
+- `MODELS_LIST` – A JSON array of model objects returned by `/v1/models`.
+- `AI_API_URL` – URL of a single OpenAI‑compatible chat completions endpoint.
+- `AI_API_KEY` – API key for that single legacy endpoint. When unset, `/api/v1/generate` returns `provider_not_configured`; all other (OpenAI-compatible) endpoints are unaffected.
+- `AI_MODEL` – Default model for the legacy endpoint.
+
+Prefer the OpenAI-compatible endpoints (`/v1/chat/completions`, etc.), which route through the Provider Registry + ConnectionManager.
 
 ## Provider Management
 
@@ -578,8 +588,51 @@ accessible without auth. Non-admin keys receive `403 admin_forbidden`.
 | GET | `/admin/api/monitoring` | Full metrics snapshot |
 | GET | `/admin/api/logs` | Request log (filterable: `?providerId=&apiKeyId=&model=&status=&limit=`) |
 | GET | `/admin/api/health` | Provider health overview |
+| GET | `/admin/api/routing` | Current routing strategies (provider/connection/key) + available options + descriptions |
+| PUT | `/admin/api/routing` | Update routing strategies (validated, hot-applied, persisted to `config/routing.json`) |
+| GET | `/admin/api/routing/status` | Aggregated routing status (providers/connections/health counts) |
+| GET | `/admin/api/routing/activity` | Recent routing decisions (time/model/provider/connection/strategy/latency/status — no secrets) |
+| GET | `/admin/api/routing/rules` | List model-based routing rules |
+| POST | `/admin/api/routing/rules` | Create a model-based routing rule (`{id?, model, strategy?, providerOrder?, connectionIds?, enabled?}`) |
+| PUT | `/admin/api/routing/rules/:id` | Update a model-based routing rule |
+| DELETE | `/admin/api/routing/rules/:id` | Delete a model-based routing rule |
 | GET | `/admin/api/config` | Current configuration |
 | PUT | `/admin/api/config` | Live edit + write to disk + reload |
+
+### Routing Management
+
+The gateway chooses a provider (and a connection within it) per request using
+the existing `ModelRouter` + `RoutingStrategy` + `AccountManager` pipeline —
+no separate router. Supported strategies:
+
+| Strategy | Behaviour |
+|---|---|
+| `priority` (default) | Highest-priority eligible candidate first |
+| `round-robin` | Stateful sequential rotation (identity-anchored cursor; concurrency-safe) |
+| `least-used` | Lowest current usage first |
+| `weighted` | Weighted random (long-run distribution ≈ weights) |
+| `random` | Uniform random |
+| `fastest-response` / `lowest-latency` | Lowest historical latency (falls back to priority with no data) |
+
+Configuration scopes (all hot-reloadable, persisted to `config/routing.json`):
+
+- `strategy` — global provider routing
+- `connectionStrategy` — global connection (account) routing
+- `keySelectionStrategy` — per-provider API key selection
+- `providerStrategies` — per-provider connection strategy overrides
+
+Model-based routing rules (`config/routingRules.json` → `modelRules`) bind a
+model to a strategy, an explicit provider order, and an optional connection
+allow-list. API key provider/model permissions are always enforced before
+routing; disabled providers/connections and open-circuit providers are never
+selected. Failover honours 401 (auth-marked, no blind retry), 429, 5xx, and
+timeouts — bounded by the per-provider retry budget, never infinite.
+
+Changes via `PUT /admin/api/routing` or the Dashboard → Routing page apply to
+the next request without restarting the gateway and without dropping
+in-flight requests. Invalid strategies are rejected with `400` and the
+running configuration is left untouched; a missing/invalid config file falls
+back to the safe `priority` default.
 
 ### Security
 
@@ -590,6 +643,88 @@ accessible without auth. Non-admin keys receive `403 admin_forbidden`.
 - In open-gateway mode (no keys configured), admin access is unrestricted.
 
 See `examples/admin.integration.js` for the full test suite.
+
+## Dashboard Console (Next.js)
+
+In addition to the built-in single-page `/admin` UI, a full management console
+lives in `dashboard/` — a Next.js 14 + TypeScript + Tailwind CSS app using
+Recharts and Lucide icons. It talks **only** to the existing backend admin API
+(`/admin/api/*`); it does not introduce any second registry, router, auth, key,
+quota, usage, or backup system.
+
+### Stack
+
+- Next.js 14 (App Router), TypeScript (strict), Tailwind CSS
+- Recharts (charts), Lucide (icons)
+- Dependency-free data layer (`useQuery` hook) and a single centralized API
+  client in `dashboard/src/lib/api/`
+
+### Setup
+
+```bash
+cd dashboard
+npm install
+```
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GATEWAY_BACKEND_URL` | `http://127.0.0.1:3000` | Backend the dashboard proxies `/api/gateway/*` to (see `dashboard/next.config.js`) |
+| `NEXT_PUBLIC_ENV` | `development` | Environment badge shown in the header |
+
+The dashboard proxies all backend calls same-origin through
+`/api/gateway/*`, so the admin Bearer token stays same-origin and is held only
+in memory + `sessionStorage` (never `localStorage`, never in a URL, never
+logged).
+
+### Development
+
+```bash
+# terminal 1 — backend
+npm start                    # or: npm run dev
+
+# terminal 2 — dashboard
+cd dashboard && npm run dev  # http://127.0.0.1:3100
+```
+
+### Production build & run
+
+```bash
+cd dashboard
+npm run build
+npm start                    # serves on port 3100
+```
+
+### Validation commands
+
+```bash
+cd dashboard
+npm test        # component/logic smoke tests
+npm run typecheck
+npm run lint
+npm run build
+```
+
+### Sign-in
+
+Open `http://127.0.0.1:3100`, then sign in with an API key that has
+`role: "admin"`. The key is validated server-side against
+`GET /admin/api/system`; authorization always remains server-side.
+
+### Routes
+
+`/dashboard`, `/api-keys`, `/api-keys/new`, `/api-keys/[id]`, `/providers`,
+`/providers/[id]`, `/models`, `/connections`, `/usage`, `/quota`, `/backups`,
+`/settings`, `/logs`, `/system-health`, plus `/login`, `/forbidden`, and 404 /
+error pages.
+
+### Security notes
+
+- Never displays `keyHash`, provider credentials, or OAuth tokens.
+- A newly created (or rotated) API key plaintext is shown exactly once and is
+  never persisted to `localStorage` or logged.
+- All numbers come from real backend analytics — no hardcoded/demo data.
 
 ## Running
 

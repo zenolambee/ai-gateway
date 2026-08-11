@@ -62,7 +62,14 @@ class ConnectionManager {
   async disconnect(accountId) {
     if (!this.registry) return false;
     const ok = await this.registry.disconnect(accountId);
-    if (ok) this._audit('disconnect', accountId, null, {});
+    if (ok) {
+      this._audit('disconnect', accountId, null, {});
+      // Keep the AccountManager's enhanced index in sync so the removed
+      // connection is never selected again.
+      if (this.accountManager && typeof this.accountManager.removeAccount === 'function') {
+        this.accountManager.removeAccount(accountId);
+      }
+    }
     return ok;
   }
 
@@ -72,13 +79,36 @@ class ConnectionManager {
     if (!status || status.state === 'disconnected') {
       throw new Error(`ConnectionManager: account "${accountId}" not found for reconnect`);
     }
-    // Read the existing account to get the credential.
+    // Read the stored account and decrypt the credential envelope in-memory
+    // (never logged, never persisted in plaintext).
     const raw = await this.registry._loadAccount(accountId);
-    if (raw && raw.credential) {
-      // Add credential back to the connect payload.
-      await this.registry.connect({ ...raw, credential: undefined, _cred: raw.credential });
+    const plain = raw && this.registry._plain(raw);
+    const cred = plain && plain.credential;
+    if (cred && (cred.apiKey || cred.accessToken || cred.sessionToken || cred.cookies)) {
+      const enhanced = this.accountManager && this.accountManager._accounts
+        ? this.accountManager._accounts.get(accountId)
+        : null;
+      await this.registry.connect({
+        accountId,
+        providerId: plain.providerId,
+        authType: plain.authType,
+        name: plain.name || plain.displayName,
+        apiKey: cred.apiKey,
+        accessToken: cred.accessToken,
+        refreshToken: cred.refreshToken,
+        sessionToken: cred.sessionToken,
+        cookies: cred.cookies,
+      });
+      // Restore enhanced fields (enabled/priority/weight/tags/…) that the
+      // adapter's connect payload does not carry.
+      if (enhanced && this.registry._saveAccount) {
+        const reRaw = this.registry.accounts.get(accountId);
+        if (reRaw) {
+          await this.registry._saveAccount({ ...enhanced, credential: reRaw.credential }, reRaw.authType);
+        }
+      }
       this._audit('reconnect', accountId, status.providerId, {});
-      return raw;
+      return plain;
     }
     throw new Error(`ConnectionManager: reconnect failed for "${accountId}": no credential`);
   }
@@ -131,19 +161,117 @@ class ConnectionManager {
    * Falls back to the first enabled account when no strategy matches.
    * @param {string} providerId
    * @param {object} [opts]
+   * @param {string[]} [opts.connectionIds] - model-rule connection allow-list;
+   *   when provided, only these connection ids are eligible.
    * @returns {Promise<object|null>} account public view
    */
   async selectConnection(providerId, opts = {}) {
     if (!this.accountManager) return null;
+    const allow = Array.isArray(opts.connectionIds) && opts.connectionIds.length > 0
+      ? new Set(opts.connectionIds) : null;
     try {
+      // When a connection allow-list is active, pick from the restricted pool
+      // directly (the AccountManager strategy runs over the filtered set).
+      if (allow) {
+        const all = await this.accountManager.getAvailableAccounts(providerId);
+        const pool = all.filter((a) => allow.has(a.accountId || a.id));
+        if (pool.length === 0) return null;
+        // Delegate strategy selection over the restricted pool by calling
+        // selectAccount with a temporary id filter is not supported — instead
+        // run the same strategies inline for the restricted pool.
+        return this._selectFromPool(pool, providerId, opts);
+      }
       const acct = await this.accountManager.selectAccount(providerId, opts);
       if (acct) return acct;
     } catch (_) { /* fallback */ }
 
     // Fallback: return the first enabled, non-expired account.
     const all = await this.listConnections(providerId);
-    const available = all.filter((a) => a.enabled !== false && a.status !== 'expired' && a.status !== 'disconnected');
+    let available = all.filter((a) => a.enabled !== false && a.status !== 'expired' && a.status !== 'disconnected');
+    if (allow) available = available.filter((a) => allow.has(a.id || a.accountId));
     return available.length > 0 ? available[0] : null;
+  }
+
+  /**
+   * Run the configured selection strategy over a pre-filtered account pool
+   * (used when a model routing rule restricts the eligible connections).
+   * Reuses the AccountManager's health data and cursor state — no duplicate
+   * state. Round-robin rotation is anchored on account identity.
+   * @param {Array<object>} pool - eligible account records (raw enhanced)
+   * @param {string} providerId
+   * @param {object} [opts]
+   * @returns {object|null} public view of the selected account
+   * @private
+   */
+  _selectFromPool(pool, providerId, opts = {}) {
+    if (!Array.isArray(pool) || pool.length === 0) return null;
+    if (pool.length === 1) {
+      this.accountManager.recordUsage(pool[0].accountId || pool[0].id);
+      return this.accountManager.publicView(pool[0]);
+    }
+    const am = this.accountManager;
+    const configured = am._cursors.get(providerId);
+    const strategy = opts.strategy || (configured && configured.strategy) || am.defaultStrategy || 'priority';
+    const sorted = [...pool].sort((a, b) => (a.priority || 100) - (b.priority || 100));
+    let selected;
+    switch (strategy) {
+      case 'round-robin': {
+        const cursor = am._cursors.get(providerId) || {};
+        const lastId = cursor.lastAccountId || null;
+        let idx = 0;
+        if (lastId) {
+          const found = sorted.findIndex((a) => (a.accountId || a.id) === lastId);
+          if (found !== -1) idx = (found + 1) % sorted.length;
+        }
+        selected = sorted[idx];
+        cursor.lastAccountId = selected.accountId || selected.id;
+        delete cursor.lastIdx;
+        am._cursors.set(providerId, cursor);
+        break;
+      }
+      case 'random':
+        selected = sorted[Math.floor(Math.random() * sorted.length)];
+        break;
+      case 'least-used': {
+        const scored = sorted.map((a) => {
+          const h = am._health.get(a.accountId || a.id);
+          return { account: a, used: h ? (h.successCount || 0) + (h.failureCount || 0) : 0 };
+        });
+        scored.sort((a, b) => a.used - b.used);
+        selected = scored[0].account;
+        break;
+      }
+      case 'weighted': {
+        const rawW = sorted.map((a) => (typeof a.weight === 'number' && a.weight > 0 ? a.weight : 0));
+        const anyPos = rawW.some((w) => w > 0);
+        const weights = anyPos ? rawW : sorted.map(() => 1);
+        const total = weights.reduce((s, w) => s + w, 0);
+        let r = Math.random() * total;
+        for (let i = 0; i < sorted.length; i += 1) { r -= weights[i]; if (r < 0) { selected = sorted[i]; break; } }
+        if (!selected) selected = sorted[sorted.length - 1];
+        break;
+      }
+      case 'fastest':
+      case 'fastest-response':
+      case 'lowest-latency': {
+        const scored = sorted.map((a) => ({ account: a, latency: am._health.get(a.accountId || a.id)?.lastLatencyMs }));
+        if (!scored.some((s) => typeof s.latency === 'number')) selected = sorted[0];
+        else {
+          scored.sort((a, b) => (typeof a.latency === 'number' ? a.latency : Infinity) - (typeof b.latency === 'number' ? b.latency : Infinity));
+          selected = scored[0].account;
+        }
+        break;
+      }
+      case 'priority':
+      default:
+        selected = sorted[0];
+        break;
+    }
+    if (selected) {
+      am.recordUsage(selected.accountId || selected.id);
+      return am.publicView(selected);
+    }
+    return null;
   }
 
   /**
@@ -237,7 +365,16 @@ class ConnectionManager {
     // No usable credential material — fall back to legacy path.
     if (!apiKey && Object.keys(headers).length === 0) return null;
 
-    return { connectionId: accountId, providerId, authType, apiKey, headers };
+    return {
+      connectionId: accountId,
+      providerId,
+      authType,
+      apiKey,
+      headers,
+      connectionName: selected.displayName || selected.name || accountId,
+      strategy: this.accountManager && typeof this.accountManager.getStrategy === 'function'
+        ? this.accountManager.getStrategy(providerId) : null,
+    };
   }
 
   /**

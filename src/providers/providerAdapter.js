@@ -791,6 +791,18 @@ class ProviderAdapter {
     if (input.max_output_tokens !== undefined && input.max_output_tokens !== null) {
       payload.max_tokens = input.max_output_tokens;
     }
+    if (Array.isArray(input.tools) && input.tools.length > 0) {
+      payload.tools = input.tools.map((t) => {
+        if (t && typeof t === 'object' && t.function && typeof t.function === 'object') return t;
+        if (t && typeof t === 'object' && t.name) {
+          return { type: 'function', function: t };
+        }
+        return t;
+      });
+    }
+    if (input.tool_choice !== undefined && input.tool_choice !== null) {
+      payload.tool_choice = input.tool_choice;
+    }
     return payload;
   }
 

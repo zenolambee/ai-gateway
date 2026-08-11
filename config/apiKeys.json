@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "id": "admin-key",
+      "key": "sk-gateway-admin-8d065bae201eab55d59b73d874fe845b4ec8dd643a9bbb41",
+      "name": "Admin Key",
+      "status": "active",
+      "role": "admin",
+      "createdAt": 1786192054978
+    }
+  ]
+}

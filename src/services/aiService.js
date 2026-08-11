@@ -9,8 +9,15 @@ const AppError = require('../utils/AppError');
  * @returns {Promise<string>} The generated text.
  */
 async function generate(prompt, model = 'deepseek-v4-flash') {
+  // Legacy single-provider demo endpoint. AI_API_KEY is OPTIONAL (Prompt 28):
+  // the Gateway starts fine without it. Only this deprecated route needs it,
+  // so we return a clean standardized configuration error rather than a raw
+  // 500 when it is absent. Prefer the OpenAI-compatible endpoints, which use
+  // Dashboard/ConnectionManager-managed provider connections.
   if (!config.aiApiKey) {
-    throw new AppError('AI_API_KEY is not configured', 500);
+    throw new AppError('The legacy generate endpoint has no provider connection configured.', 503, {
+      code: 'PROVIDER_NOT_CONFIGURED',
+    });
   }
 
   try {

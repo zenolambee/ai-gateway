@@ -18,5 +18,15 @@
       "when": { "provider.successRate": { "<": 80 } },
       "then": "demote"
     }
+  ],
+  "modelRules": [
+    {
+      "id": "rule-gpt-5-6",
+      "model": "gpt-5.6",
+      "strategy": "round-robin",
+      "providerOrder": ["openai"],
+      "connectionIds": ["openai-main", "openai-backup"],
+      "enabled": true
+    }
   ]
 }

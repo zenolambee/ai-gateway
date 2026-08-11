@@ -172,6 +172,25 @@ class ConnectionRegistry {
 
   /** List all managed accounts with status. */
   async listAccounts() {
+    // Reconcile the in-memory map with the storage backend (source of truth)
+    // so entries removed by disconnect() never linger (e.g. when an account
+    // was re-added into the map during a status check after deletion).
+    this._reconcilePromise = (this._reconcilePromise || Promise.resolve()).then(async () => {
+      const store = this._getStore();
+      if (store) {
+        try {
+          const keys = await store.keys('*');
+          const marker = `${this._prefix}:`;
+          const liveIds = new Set(
+            keys.filter((k) => k.includes(marker)).map((k) => k.slice(k.indexOf(marker) + marker.length))
+          );
+          for (const accountId of [...this.accounts.keys()]) {
+            if (!liveIds.has(accountId)) this.accounts.delete(accountId);
+          }
+        } catch (_) { /* keep in-memory view on storage errors */ }
+      }
+    });
+    await this._reconcilePromise;
     const out = [];
     for (const account of this.accounts.values()) {
       const adapter = this._adapter(account.providerId, account.authType);

@@ -40,6 +40,8 @@ class StreamingResponseAdapter {
     this.contentBuffer = '';
     this.usage = null;
     this.providerAdapter = null;
+    this.toolCalls = new Map(); // index -> { id, name, argsBuffer }
+    this.toolFinished = false;
   }
 
   /**
@@ -170,6 +172,30 @@ class StreamingResponseAdapter {
         deltaContent = choice.delta.content;
         this.contentBuffer += deltaContent;
       }
+      if (choice && choice.delta && Array.isArray(choice.delta.tool_calls)) {
+        for (const tcd of choice.delta.tool_calls) {
+          const idx = tcd.index !== undefined ? tcd.index : 0;
+          let tc = this.toolCalls.get(idx);
+          if (!tc) {
+            tc = {
+              id: (tcd.id && tcd.id !== null)
+                ? tcd.id
+                : `call_${crypto.randomBytes(8).toString('hex')}`,
+              name: (tcd.function && tcd.function.name) || '',
+              argsBuffer: '',
+              added: false,
+            };
+            this.toolCalls.set(idx, tc);
+          }
+          if (tcd.id && tcd.id !== tc.id) tc.id = tcd.id;
+          if (tcd.function) {
+            if (tcd.function.name) tc.name = tcd.function.name;
+            if (typeof tcd.function.arguments === 'string') {
+              tc.argsBuffer += tcd.function.arguments;
+            }
+          }
+        }
+      }
       if (choice && choice.finish_reason) {
         finishReason = choice.finish_reason;
       }
@@ -180,6 +206,38 @@ class StreamingResponseAdapter {
         output_tokens: chunk.usage.completion_tokens || 0,
         total_tokens: chunk.usage.total_tokens || 0,
       };
+    }
+
+    // Emit function_call items as their first argument fragment arrives.
+    if (this.toolCalls.size > 0 && !this.toolFinished) {
+      for (const [idx, tc] of this.toolCalls) {
+        if (tc.added) continue;
+        tc.added = true;
+        if (this.textIndex === undefined) this.textIndex = 1;
+        const outIdx = this.textIndex;
+        events.push({
+          data: JSON.stringify({
+            type: 'response.output_item.added',
+            output_index: outIdx,
+            item: {
+              type: 'function_call',
+              id: tc.id,
+              call_id: tc.id,
+              name: tc.name,
+              arguments: '',
+              status: 'in_progress',
+            },
+          }),
+        });
+        events.push({
+          data: JSON.stringify({
+            type: 'response.function_call_arguments.delta',
+            output_index: outIdx,
+            item_id: tc.id,
+            delta: tc.argsBuffer,
+          }),
+        });
+      }
     }
 
     if (deltaContent) {
@@ -194,27 +252,85 @@ class StreamingResponseAdapter {
     }
 
     if (finishReason) {
-      events.push({
-        data: JSON.stringify({
-          type: 'response.output_text.done',
-          output_index: 0,
-          content_index: 0,
-          text: this.contentBuffer,
-        }),
-      });
-      events.push({
-        data: JSON.stringify({
-          type: 'response.output_item.done',
-          output_index: 0,
-          item: {
-            type: 'message',
-            id: this.messageId,
-            status: 'completed',
-            role: 'assistant',
-            content: [{ type: 'output_text', text: this.contentBuffer }],
-          },
-        }),
-      });
+      if (this.toolCalls.size > 0) {
+        for (const [idx, tc] of this.toolCalls) {
+          const outIdx = this.textIndex !== undefined ? this.textIndex : 0;
+          events.push({
+            data: JSON.stringify({
+              type: 'response.function_call_arguments.done',
+              output_index: outIdx,
+              item_id: tc.id,
+              arguments: tc.argsBuffer,
+            }),
+          });
+          events.push({
+            data: JSON.stringify({
+              type: 'response.output_item.done',
+              output_index: outIdx,
+              item: {
+                type: 'function_call',
+                id: tc.id,
+                call_id: tc.id,
+                name: tc.name,
+                arguments: tc.argsBuffer,
+                status: 'completed',
+              },
+            }),
+          });
+        }
+        this.toolFinished = true;
+      }
+
+      const outItems = [];
+      if (this.started) {
+        events.push({
+          data: JSON.stringify({
+            type: 'response.output_text.done',
+            output_index: 0,
+            content_index: 0,
+            text: this.contentBuffer,
+          }),
+        });
+        events.push({
+          data: JSON.stringify({
+            type: 'response.output_item.done',
+            output_index: 0,
+            item: {
+              type: 'message',
+              id: this.messageId,
+              status: 'completed',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: this.contentBuffer }],
+            },
+          }),
+        });
+        outItems.push({
+          type: 'message',
+          id: this.messageId,
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: this.contentBuffer }],
+        });
+      }
+      for (const [idx, tc] of this.toolCalls) {
+        outItems.push({
+          type: 'function_call',
+          id: tc.id,
+          call_id: tc.id,
+          name: tc.name,
+          arguments: tc.argsBuffer,
+          status: 'completed',
+        });
+      }
+      if (outItems.length === 0) {
+        outItems.push({
+          type: 'message',
+          id: this.messageId,
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: this.contentBuffer }],
+        });
+      }
       events.push({
         data: JSON.stringify({
           type: 'response.completed',
@@ -224,15 +340,7 @@ class StreamingResponseAdapter {
             created_at: this.createdAt,
             model: this.model,
             status: 'completed',
-            output: [
-              {
-                type: 'message',
-                id: this.messageId,
-                status: 'completed',
-                role: 'assistant',
-                content: [{ type: 'output_text', text: this.contentBuffer }],
-              },
-            ],
+            output: outItems,
             usage: this.usage || { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
           },
         }),

@@ -1,11 +1,17 @@
 {
   "id": "deepseek",
   "name": "DeepSeek",
-  "enabled": true,
+  "enabled": false,
   "adapter": "deepseek",
   "baseURL": "https://api.deepseek.com/v1",
-  "apiKeys": ["${DEEPSEEK_API_KEY}"],
-  "supportedModels": ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
+  "apiKeys": [
+    "${DEEPSEEK_API_KEY}"
+  ],
+  "supportedModels": [
+    "deepseek-v4-flash",
+    "deepseek-chat",
+    "deepseek-reasoner"
+  ],
   "priority": 1,
   "timeout": 30000
 }

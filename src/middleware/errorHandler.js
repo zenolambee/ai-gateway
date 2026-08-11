@@ -40,7 +40,8 @@ function openAIErrorMeta(err) {
       return { type: 'invalid_request_error', code: 'model_not_found' };
     case 'NO_API_KEYS':
     case 'ALL_KEYS_UNAVAILABLE':
-      return { type: 'invalid_request_error', code: 'no_api_keys' };
+    case 'PROVIDER_NOT_CONFIGURED':
+      return { type: 'invalid_request_error', code: 'provider_not_configured' };
     case 'PROVIDER_TIMEOUT':
       return { type: 'timeout', code: 'provider_timeout' };
     case 'PROVIDER_UNAUTHORIZED':

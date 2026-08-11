@@ -1,4 +1,6 @@
 {
   "strategy": "priority",
-  "keySelectionStrategy": "round-robin"
+  "connectionStrategy": "priority",
+  "keySelectionStrategy": "round-robin",
+  "providerStrategies": {}
 }

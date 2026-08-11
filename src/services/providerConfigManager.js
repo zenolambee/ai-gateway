@@ -64,6 +64,8 @@ class ProviderConfigManager {
     this.ruleEngine = ruleEngine || null;
     this.discovery = discovery || null;
     this.virtualModelRegistry = virtualModelRegistry || null;
+    // Late-bound (avoids an init-order cycle with ConnectionManager).
+    this.accountManager = null;
 
     this.debounceMs = opts.debounceMs !== undefined ? opts.debounceMs : 100;
     this._watcher = null;
@@ -72,6 +74,14 @@ class ProviderConfigManager {
     this._reloadCount = 0;
     this._reloadFailures = 0;
   }
+
+  /**
+   * Late-bind the AccountManager (constructed after the ProviderConfigManager
+   * in the composition root). Used by the routing hot-reload cascade to
+   * apply connection-level strategies without a restart.
+   * @param {object} mgr
+   */
+  setAccountManager(mgr) { this.accountManager = mgr || null; }
 
   /**
    * Start watching the provider config directory for changes.
@@ -246,13 +256,31 @@ class ProviderConfigManager {
 
     // Re-apply the routing strategy from the current config so a hot reload
     // of config/routing.json takes effect without a restart. The modelRouter
-    // keeps its own strategy state; we refresh it here.
+    // keeps its own strategy state; we refresh it here. The routing config
+    // file itself is re-read from disk (fs.watch only told us it changed).
     if (this.modelRouter && this.routingConfig) {
       try {
-        const strategy = this.routingConfig.strategy || 'priority';
-        this.modelRouter.setStrategy(strategy);
+        const { loadRoutingConfig } = require('../config/routingConfig');
+        const fresh = loadRoutingConfig();
+        this.routingConfig.strategy = fresh.strategy;
+        this.routingConfig.connectionStrategy = fresh.connectionStrategy;
+        this.routingConfig.keySelectionStrategy = fresh.keySelectionStrategy;
+        this.routingConfig.providerStrategies = fresh.providerStrategies || {};
+        this.modelRouter.setStrategy(fresh.strategy || 'priority');
+        // Connection-level routing: refresh the AccountManager default and
+        // per-provider overrides (late-bound via setAccountManager).
+        if (this.accountManager) {
+          this.accountManager.setDefaultStrategy(fresh.connectionStrategy || 'priority');
+          for (const [pid, sid] of Object.entries(fresh.providerStrategies || {})) {
+            this.accountManager.setProviderStrategy(pid, sid);
+          }
+        }
+        // Key selection default.
+        if (this.apiKeyManager && fresh.keySelectionStrategy) {
+          this.apiKeyManager.defaultStrategy = fresh.keySelectionStrategy;
+        }
       } catch (e) {
-        logger.warn('ProviderConfigManager: modelRouter.setStrategy failed', { error: e && e.message });
+        logger.warn('ProviderConfigManager: routing config reload failed', { error: e && e.message });
       }
     }
 
@@ -271,8 +299,12 @@ class ProviderConfigManager {
     // take effect without a restart.
     if (this.ruleEngine) {
       try {
-        const { loadRoutingRulesConfig } = require('../config/routingRulesConfig');
+        const { loadRoutingRulesConfig, loadModelRoutingRules } = require('../config/routingRulesConfig');
         this.ruleEngine.load(loadRoutingRulesConfig().rules);
+        // Model-based routing rules (Dashboard-managed) share the same file.
+        if (this.modelRouter && typeof this.modelRouter.setModelRules === 'function') {
+          this.modelRouter.setModelRules(loadModelRoutingRules());
+        }
       } catch (e) {
         logger.warn('ProviderConfigManager: ruleEngine.load failed', { error: e && e.message });
       }

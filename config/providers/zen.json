@@ -1,0 +1,17 @@
+{
+  "id": "zen",
+  "name": "Zen (opencode)",
+  "enabled": true,
+  "adapter": "zen",
+  "baseURL": "https://opencode.ai/zen/v1",
+  "apiKeys": [
+    "${ZEN_API_KEY}"
+  ],
+  "supportedModels": [
+    "deepseek-v4-flash-free",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro"
+  ],
+  "priority": 1,
+  "timeout": 300000
+}

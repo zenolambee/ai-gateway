@@ -34,6 +34,7 @@ const {
   connectionManager,
   backupService,
   usageAnalyticsService,
+  adapterRegistry: providerAdapterRegistry,
 } = require('../services');
 const { SELECTION_STRATEGIES, validateVirtualModelsConfig } = require('../config/virtualModelsConfig');
 
@@ -102,27 +103,95 @@ router.get('/overview', (req, res) => {
 });
 
 // --- Providers ---
-router.get('/providers', (req, res) => {
-  const providers = providerManager.listProviders();
-  const health = healthMonitor.getAllHealth();
-  res.json({
-    providers: providers.map((p) => ({
-      id: p.id,
-      name: p.name,
-      enabled: p.enabled,
-      baseURL: p.baseURL,
-      supportedModels: p.supportedModels,
-      priority: p.priority,
-      timeout: p.timeout,
-      weight: p.weight || 1,
-      adapter: p.adapter || 'generic-openai',
-      retryPolicy: p.retryPolicy || null,
-      fallbackPolicy: p.fallbackPolicy !== undefined ? p.fallbackPolicy : true,
-      apiKeys: (p.apiKeys || []).map((k) => k ? `${k.slice(0, 4)}...${k.slice(-4)}` : ''),
-      health: health[p.id] || null,
-    })),
-  });
+
+// Mask a provider API key (never expose real secrets in admin responses).
+function maskProviderKey(k) {
+  const v = typeof k === 'string' ? k : (k && typeof k === 'object' ? k.value : '');
+  return v ? `${v.slice(0, 4)}...${v.slice(-4)}` : '';
+}
+
+// Redacted public view of a provider config (shared by list + detail).
+function providerView(p, extra = {}) {
+  return {
+    id: p.id,
+    name: p.name,
+    enabled: p.enabled,
+    baseURL: p.baseURL,
+    supportedModels: p.supportedModels,
+    priority: p.priority,
+    timeout: p.timeout,
+    weight: p.weight || 1,
+    adapter: p.adapter || 'generic-openai',
+    retryPolicy: p.retryPolicy || null,
+    fallbackPolicy: p.fallbackPolicy !== undefined ? p.fallbackPolicy : true,
+    apiKeys: (p.apiKeys || []).map(maskProviderKey),
+    health: extra.health !== undefined ? extra.health : null,
+    connections: extra.connections !== undefined ? extra.connections : undefined,
+    disabledReason: p.enabled ? null : (providerManager.getDisabledReason(p.id) || 'Disabled in config'),
+    createdAt: p.createdAt || null,
+    updatedAt: p.updatedAt || null,
+  };
+}
+
+// Shared helper: flip a provider's enabled flag, persist to disk, and run
+// the reload cascade. Runtime-safe: the ProviderManager performs an atomic
+// swap, so in-flight requests finish with the old config while new requests
+// immediately see the provider as enabled/disabled. Models, credentials,
+// API key permissions and usage history are all preserved untouched.
+async function setProviderEnabled(id, enabled) {
+  const existing = providerManager.providersById.get(id);
+  if (!existing) return null;
+  const updated = { ...existing, enabled, updatedAt: Date.now() };
+  delete updated.health;
+  delete updated.disabledReason;
+  delete updated.connections;
+  delete updated.usage;
+  const allProviders = providerManager.listProviders().map((p) => (p.id === id ? updated : p));
+  const result = providerManager.updateProviders(allProviders);
+  if (!result.success) {
+    throw new AppError(`Validation failed: ${result.errors.join('; ')}`, 400, {
+      code: 'INVALID_REQUEST', errors: result.errors,
+    });
+  }
+  providerConfigManager.reloadCascade(result.providers);
+  // Persist the new state so it survives restarts (config files remain the
+  // source of truth for the provider registry).
+  try {
+    const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
+    if (fs.existsSync(dir)) {
+      fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(updated, null, 2));
+    }
+  } catch (err) {
+    require('../utils/logger').warn('Provider state persistence failed (runtime state applied)', {
+      providerId: id, error: err && err.message,
+    });
+  }
+  return providerManager.providersById.get(id);
+}
+
+router.get('/providers', async (req, res, next) => {
+  try {
+    const providers = providerManager.listProviders();
+    const health = healthMonitor.getAllHealth();
+    // Connection counts per provider (ConnectionManager/AccountManager).
+    let accounts = [];
+    try {
+      accounts = connectionManager ? await connectionManager.listConnections() : [];
+    } catch (_) { accounts = []; }
+    const connCount = {};
+    for (const a of accounts || []) {
+      const pid = a.providerId || a.provider;
+      if (pid) connCount[pid] = (connCount[pid] || 0) + 1;
+    }
+    res.json({
+      providers: providers.map((p) => providerView(p, { health: health[p.id] || null, connections: connCount[p.id] || 0 })),
+    });
+  } catch (err) {
+    next(err);
+  }
 });
+
+
 
 // Update provider config (live edit)
 router.put('/providers/:id', (req, res, next) => {
@@ -134,11 +203,32 @@ router.put('/providers/:id', (req, res, next) => {
     }
 
     // Merge the update into the existing config
+    // Adapter validation when the update changes the adapter — a provider
+    // must never point at an unregistered adapter.
+    if (req.body && req.body.adapter !== undefined && req.body.adapter !== null && req.body.adapter !== existing.adapter) {
+      const known = providerAdapterRegistry ? [...providerAdapterRegistry.adapterClasses.keys()] : [];
+      const sdkIds = providerSDKRegistry && typeof providerSDKRegistry.listManifests === 'function'
+        ? providerSDKRegistry.listManifests().map((m) => m.id || m.providerId).filter(Boolean)
+        : [];
+      if (typeof req.body.adapter !== 'string' || !req.body.adapter || (!known.includes(req.body.adapter) && !sdkIds.includes(req.body.adapter))) {
+        throw new AppError(
+          `Unknown adapter "${req.body.adapter}". Available: ${[...new Set([...known, ...sdkIds])].sort().join(', ')}`,
+          400, { code: 'INVALID_REQUEST' }
+        );
+      }
+    }
+
     const updated = {
       ...existing,
       ...req.body,
       id, // prevent id change
+      createdAt: existing.createdAt || req.body.createdAt || Date.now(),
+      updatedAt: Date.now(),
     };
+    delete updated.health;
+    delete updated.disabledReason;
+    delete updated.connections;
+    delete updated.usage;
 
     // Build the full provider list with the updated entry
     const allProviders = providerManager.listProviders().map((p) => {
@@ -156,7 +246,84 @@ router.put('/providers/:id', (req, res, next) => {
     // Run the reload cascade through the config manager's public API
     providerConfigManager.reloadCascade(result.providers);
 
-    res.json({ success: true, provider: updated });
+    // Persist the update so it survives restarts (best-effort; runtime
+    // state is already applied).
+    try {
+      const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
+      if (fs.existsSync(dir)) {
+        fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(updated, null, 2));
+      }
+    } catch (err) {
+      require('../utils/logger').warn('Provider update persistence failed (runtime state applied)', {
+        providerId: id, error: err && err.message,
+      });
+    }
+
+    res.json({ success: true, provider: providerView(providerManager.providersById.get(id) || updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Enable/disable a provider (runtime-safe). The provider, its models,
+// connections, credentials, API key permissions and usage history are all
+// preserved — the router simply stops returning it as a candidate because
+// ModelRouter only considers `getEnabledProviders()`.
+router.post('/providers/:id/enable', async (req, res, next) => {
+  try {
+    const updated = await setProviderEnabled(req.params.id, true);
+    if (!updated) {
+      throw new AppError(`Provider "${req.params.id}" not found`, 404, { code: 'PROVIDER_NOT_FOUND' });
+    }
+    require('../utils/logger').info('PROVIDER_ENABLED', { providerId: req.params.id });
+    res.json({ success: true, provider: providerView(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/providers/:id/disable', async (req, res, next) => {
+  try {
+    const updated = await setProviderEnabled(req.params.id, false);
+    if (!updated) {
+      throw new AppError(`Provider "${req.params.id}" not found`, 404, { code: 'PROVIDER_NOT_FOUND' });
+    }
+    require('../utils/logger').info('PROVIDER_DISABLED', { providerId: req.params.id });
+    res.json({ success: true, provider: providerView(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Registered adapter ids (legacy ProviderAdapterRegistry + SDK manifests).
+// NOTE: must be defined BEFORE '/providers/:id' so 'adapters' is not
+// captured by the :id param.
+router.get('/providers/adapters', (req, res) => {
+  const legacy = providerAdapterRegistry ? [...providerAdapterRegistry.adapterClasses.keys()] : [];
+  const sdk = providerSDKRegistry && typeof providerSDKRegistry.listManifests === 'function'
+    ? providerSDKRegistry.listManifests().map((m) => m.id || m.providerId).filter(Boolean)
+    : [];
+  res.json({ adapters: [...new Set([...legacy, ...sdk])].sort() });
+});
+
+// Single provider detail (with connections, masked credentials, usage).
+router.get('/providers/:id', async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const p = providerManager.providersById.get(id);
+    if (!p) {
+      throw new AppError(`Provider "${id}" not found`, 404, { code: 'PROVIDER_NOT_FOUND' });
+    }
+    const health = healthMonitor.getAllHealth()[id] || null;
+    let connections = [];
+    try {
+      connections = connectionManager ? await connectionManager.listConnections(id) : [];
+    } catch (_) { connections = []; }
+    res.json({
+      provider: providerView(p, { health }),
+      connections,
+      usage: usageAnalyticsService ? usageAnalyticsService.getProviderUsage().find((u) => u.providerId === id) || null : null,
+    });
   } catch (err) {
     next(err);
   }
@@ -617,19 +784,34 @@ router.put('/config', async (req, res, next) => {
 /**
  * GET /admin/api/routing
  *
- * Returns the current routing strategy, the list of available strategies,
- * the per-provider key selection strategies, and the key selection strategy
- * options.
+ * Returns the current routing strategies (provider, connection, key
+ * selection), per-provider connection overrides, the list of available
+ * strategies, and human-readable strategy descriptions for the dashboard.
  */
 router.get('/routing', (req, res) => {
   res.json({
     strategy: modelRouter.getStrategy(),
+    connectionStrategy: accountManager ? accountManager.defaultStrategy : 'priority',
     keySelectionStrategy: routingConfig.keySelectionStrategy || 'round-robin',
+    providerStrategies: accountManager ? accountManager.getProviderStrategies() : {},
     availableStrategies: routingStrategy.listStrategies(),
+    availableConnectionStrategies: require('../config/routingConfig').CONNECTION_STRATEGIES,
     availableKeySelectionStrategies: keySelectionStrategy.listStrategies(),
+    strategyDescriptions: {
+      priority: 'Uses the highest-priority eligible connection first.',
+      'round-robin': 'Distributes requests sequentially across eligible connections.',
+      'least-used': 'Selects the connection with the lowest current usage.',
+      weighted: 'Distributes traffic according to configured weights.',
+      random: 'Randomly selects an eligible connection.',
+      'fastest-response': 'Uses the connection with the lowest observed latency.',
+      'lowest-latency': 'Uses the connection with the lowest p50 latency.',
+      'lowest-cost': 'Uses the lowest-cost eligible provider first.',
+      'highest-success-rate': 'Uses the provider with the highest recent success rate.',
+    },
     providers: providerManager.listProviders().map((p) => ({
       id: p.id,
       keySelectionStrategy: apiKeyManager.getStrategy(p.id),
+      connectionStrategy: accountManager ? accountManager.getStrategy(p.id) : null,
     })),
   });
 });
@@ -637,48 +819,62 @@ router.get('/routing', (req, res) => {
 /**
  * PUT /admin/api/routing
  *
- * Update the routing strategy at runtime (no restart). The body should
- * contain { strategy: string } and/or { keySelectionStrategy: string }.
- * The routing strategy applies globally; the key selection strategy
- * applies per-provider via the provider config or can be set globally
- * here as the default for all providers.
+ * Update the routing strategies at runtime (no restart). The body may
+ * contain any of:
+ *   { strategy, connectionStrategy, keySelectionStrategy,
+ *     providerStrategies: { providerId: strategyId|null } }
  *
- * This does NOT write to config/routing.json — changes are in-memory and
- * revert on restart. To persist, edit config/routing.json (hot-reloaded).
+ * Changes are applied in-memory immediately (the next request uses them —
+ * in-flight requests are untouched) AND persisted to config/routing.json so
+ * a restart (or hot reload) restores the same configuration. Invalid
+ * strategies are rejected with 400 and nothing is changed.
  */
 router.put('/routing', (req, res, next) => {
   try {
-    if (req.body.strategy !== undefined) {
-      const id = req.body.strategy;
-      const available = routingStrategy.listStrategies();
-      if (!available.includes(id)) {
-        throw new AppError(`Unknown routing strategy "${id}". Available: ${available.join(', ')}`, 400, {
-          code: 'INVALID_REQUEST', available,
-        });
-      }
-      modelRouter.setStrategy(id);
+    const { validateRoutingPatch, saveRoutingConfig } = require('../config/routingConfig');
+    const { valid, errors, patch } = validateRoutingPatch(req.body || {});
+    if (!valid) {
+      throw new AppError(errors.join('; '), 400, {
+        code: 'INVALID_REQUEST',
+        available: routingStrategy.listStrategies(),
+      });
     }
-    if (req.body.keySelectionStrategy !== undefined) {
-      const id = req.body.keySelectionStrategy;
-      const available = keySelectionStrategy.listStrategies();
-      if (!available.includes(id)) {
-        throw new AppError(`Unknown key selection strategy "${id}". Available: ${available.join(', ')}`, 400, {
-          code: 'INVALID_REQUEST', available,
-        });
-      }
-      // Set as default for providers that don't override it.
-      apiKeyManager.defaultStrategy = id;
-      // Also apply to all providers currently using the previous default.
+    if (Object.keys(patch).length === 0) {
+      throw new AppError('Nothing to update — provide strategy, connectionStrategy, keySelectionStrategy, or providerStrategies', 400, {
+        code: 'INVALID_REQUEST',
+      });
+    }
+
+    if (patch.strategy !== undefined) {
+      routingConfig.strategy = patch.strategy;
+      modelRouter.setStrategy(patch.strategy);
+    }
+    if (patch.connectionStrategy !== undefined && accountManager) {
+      routingConfig.connectionStrategy = patch.connectionStrategy;
+      accountManager.setDefaultStrategy(patch.connectionStrategy);
+    }
+    if (patch.keySelectionStrategy !== undefined) {
+      routingConfig.keySelectionStrategy = patch.keySelectionStrategy;
+      apiKeyManager.defaultStrategy = patch.keySelectionStrategy;
       for (const p of providerManager.listProviders()) {
-        // Only override if the provider didn't have an explicit strategy
-        // in its config (detected by matching the previous default).
-        // We can't know the original config value here, so we set it
-        // unconditionally — the admin API is an explicit override.
-        apiKeyManager.setStrategy(p.id, id);
+        apiKeyManager.setStrategy(p.id, patch.keySelectionStrategy);
       }
     }
+    if (patch.providerStrategies !== undefined && accountManager) {
+      routingConfig.providerStrategies = { ...patch.providerStrategies };
+      // Clear overrides not present in the new map, then apply the new set.
+      const current = accountManager.getProviderStrategies();
+      for (const pid of Object.keys(current)) {
+        if (!(pid in patch.providerStrategies)) accountManager.setProviderStrategy(pid, null);
+      }
+      for (const [pid, sid] of Object.entries(patch.providerStrategies)) {
+        accountManager.setProviderStrategy(pid, sid);
+      }
+    }
+
+    // Legacy body field: providerKeySelectionStrategy (per-provider key
+    // selection override) — preserved for backward compatibility.
     if (req.body.providerKeySelectionStrategy !== undefined) {
-      // Per-provider override: { providerId: strategyId, ... }
       const overrides = req.body.providerKeySelectionStrategy;
       if (overrides && typeof overrides === 'object' && !Array.isArray(overrides)) {
         for (const [providerId, stratId] of Object.entries(overrides)) {
@@ -686,14 +882,77 @@ router.put('/routing', (req, res, next) => {
         }
       }
     }
+
+    const persisted = saveRoutingConfig(routingConfig);
     res.json({
       success: true,
       strategy: modelRouter.getStrategy(),
+      connectionStrategy: accountManager ? accountManager.defaultStrategy : null,
       keySelectionStrategy: apiKeyManager.defaultStrategy,
+      providerStrategies: accountManager ? accountManager.getProviderStrategies() : {},
+      persisted,
     });
   } catch (err) {
     next(err);
   }
+});
+
+/**
+ * GET /admin/api/routing/status
+ *
+ * Aggregated routing status for the dashboard: active strategies, provider
+ * and connection counts, and health breakdown. Secret-free.
+ */
+router.get('/routing/status', async (req, res, next) => {
+  try {
+    const providers = providerManager.listProviders();
+    const enabledProviders = providers.filter((p) => p.enabled !== false);
+    const health = healthMonitor ? healthMonitor.getAllHealth() : {};
+    const accounts = accountManager ? await accountManager.listAccounts() : [];
+    const active = accounts.filter((a) => a.enabled !== false && a.status !== 'expired' && a.status !== 'disconnected');
+    const connHealth = accountManager ? accountManager.getHealth() : {};
+    const healthy = active.filter((a) => {
+      const h = connHealth[a.id];
+      return !h || (h.failureCount || 0) === 0 || (h.successCount || 0) > 0;
+    });
+    res.json({
+      strategy: modelRouter.getStrategy(),
+      connectionStrategy: accountManager ? accountManager.defaultStrategy : 'priority',
+      keySelectionStrategy: routingConfig.keySelectionStrategy || 'round-robin',
+      providers: providers.length,
+      activeProviders: enabledProviders.length,
+      connections: accounts.length,
+      activeConnections: active.length,
+      disabledConnections: accounts.length - active.length,
+      healthyConnections: healthy.length,
+      unhealthyConnections: active.length - healthy.length,
+      providerHealth: Object.fromEntries(Object.entries(health).map(([k, v]) => [k, { online: v.online }])),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /admin/api/routing/activity
+ *
+ * Recent routing decisions (time, model, provider, connection, strategy,
+ * latency, status). Sourced from the RequestLog ring buffer — never
+ * contains credentials or API key material.
+ */
+router.get('/routing/activity', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const entries = requestLog.getRecent(limit).map((e) => ({
+    timestamp: e.timestamp,
+    model: e.model,
+    providerId: e.providerId,
+    connectionId: e.connectionId || null,
+    connectionName: e.connectionName || null,
+    strategy: e.strategy || null,
+    latencyMs: e.latencyMs,
+    status: e.status,
+  }));
+  res.json({ entries });
 });
 
 // ---------------------------------------------------------------
@@ -887,6 +1146,143 @@ router.put('/model-routing', (req, res, next) => {
     next(err);
   }
 });
+
+// ---------------------------------------------------------------
+// Model-Based Routing Rules (Dashboard-managed)
+// ---------------------------------------------------------------
+
+/**
+ * GET /admin/api/routing/rules
+ *
+ * Returns all model-based routing rules.
+ */
+router.get('/routing/rules', (req, res) => {
+  res.json({ rules: modelRouter.listModelRules() });
+});
+
+/**
+ * POST /admin/api/routing/rules
+ *
+ * Create a model-based routing rule. Body: { id?, model, strategy?,
+ * providerOrder?, connectionIds?, enabled? }. When `id` is omitted one is
+ * generated from the model. Rule is applied immediately (hot) and persisted
+ * to config/routingRules.json.
+ */
+router.post('/routing/rules', (req, res, next) => {
+  try {
+    const { validateModelRoutingRule } = require('../config/routingRulesConfig');
+    const body = req.body || {};
+    const baseId = typeof body.id === 'string' && body.id
+      ? body.id
+      : `rule-${String(body.model || 'model').replace(/[^A-Za-z0-9._-]/g, '-')}`;
+    // Auto-generated ids get a collision-proof suffix; explicit ids must be unique.
+    let ruleId = baseId;
+    if (!body.id) {
+      const existing = new Set(modelRouter.listModelRules().map((r) => r.id));
+      if (existing.has(ruleId)) {
+        ruleId = `${baseId}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+      }
+    }
+    const rule = {
+      id: ruleId,
+      model: body.model,
+      strategy: body.strategy,
+      providerOrder: body.providerOrder,
+      connectionIds: body.connectionIds,
+      enabled: body.enabled !== false,
+    };
+    const { valid, errors } = validateModelRoutingRule(rule);
+    if (!valid) {
+      throw new AppError(errors.join('; '), 400, { code: 'INVALID_REQUEST' });
+    }
+    // Strategy must be a known routing strategy.
+    if (rule.strategy && !routingStrategy.listStrategies().includes(rule.strategy)) {
+      throw new AppError(`Unknown routing strategy "${rule.strategy}"`, 400, {
+        code: 'INVALID_REQUEST', available: routingStrategy.listStrategies(),
+      });
+    }
+    if (modelRouter.listModelRules().some((r) => r.id === rule.id)) {
+      throw new AppError(`Rule "${rule.id}" already exists`, 409, { code: 'CONFLICT' });
+    }
+    modelRouter.setModelRule(rule);
+    const persisted = persistModelRules();
+    res.status(201).json({ success: true, rule, persisted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PUT /admin/api/routing/rules/:id
+ *
+ * Update a model-based routing rule (full replace of mutable fields).
+ */
+router.put('/routing/rules/:id', (req, res, next) => {
+  try {
+    const { validateModelRoutingRule } = require('../config/routingRulesConfig');
+    const id = req.params.id;
+    const existing = modelRouter.listModelRules().find((r) => r.id === id);
+    if (!existing) {
+      throw new AppError(`Routing rule "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const body = req.body || {};
+    const rule = {
+      id,
+      model: body.model !== undefined ? body.model : existing.model,
+      strategy: body.strategy !== undefined ? body.strategy : existing.strategy,
+      providerOrder: body.providerOrder !== undefined ? body.providerOrder : existing.providerOrder,
+      connectionIds: body.connectionIds !== undefined ? body.connectionIds : existing.connectionIds,
+      enabled: body.enabled !== undefined ? body.enabled : existing.enabled,
+    };
+    const { valid, errors } = validateModelRoutingRule(rule);
+    if (!valid) {
+      throw new AppError(errors.join('; '), 400, { code: 'INVALID_REQUEST' });
+    }
+    if (rule.strategy && !routingStrategy.listStrategies().includes(rule.strategy)) {
+      throw new AppError(`Unknown routing strategy "${rule.strategy}"`, 400, {
+        code: 'INVALID_REQUEST', available: routingStrategy.listStrategies(),
+      });
+    }
+    modelRouter.setModelRule(rule);
+    const persisted = persistModelRules();
+    res.json({ success: true, rule, persisted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /admin/api/routing/rules/:id
+ *
+ * Remove a model-based routing rule.
+ */
+router.delete('/routing/rules/:id', (req, res, next) => {
+  try {
+    const removed = modelRouter.removeModelRule(req.params.id);
+    if (!removed) {
+      throw new AppError(`Routing rule "${req.params.id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const persisted = persistModelRules();
+    res.json({ success: true, persisted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Persist the current model-rule set to config/routingRules.json.
+ * Best-effort — returns false when the write fails (never throws into the
+ * request path).
+ * @returns {boolean}
+ */
+function persistModelRules() {
+  try {
+    const { saveModelRoutingRules } = require('../config/routingRulesConfig');
+    return saveModelRoutingRules(modelRouter.listModelRules());
+  } catch (_) {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------
 // Provider Discovery (Sprint 10)
@@ -1244,14 +1640,17 @@ router.post('/accounts/:accountId/refresh', async (req, res, next) => {
 /**
  * DELETE /admin/api/accounts/:accountId
  *
- * Disconnect (revoke) an account.
+ * Disconnect (revoke) an account. Removes the stored credential from both
+ * the registry storage and the AccountManager index; usage/analytics
+ * history recorded under the account id is left untouched.
  */
 router.delete('/accounts/:accountId', async (req, res, next) => {
   try {
-    const ok = await connectionRegistry.disconnect(req.params.accountId);
+    const ok = await connectionManager.disconnect(req.params.accountId);
     if (!ok) {
       throw new AppError(`Account "${req.params.accountId}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
     }
+    require('../utils/logger').info('CONNECTION_DELETED', { accountId: req.params.accountId });
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -1284,15 +1683,40 @@ router.post('/accounts/hydrate', async (req, res, next) => {
 router.put('/accounts/:accountId', async (req, res, next) => {
   try {
     const id = req.params.accountId;
-    const status = await connectionRegistry.status(id).catch(() => null);
-    if (!status || status.state === 'disconnected') {
+    const raw = await connectionRegistry._loadAccount(id).catch(() => null);
+    if (!raw) {
       throw new AppError(`Account "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
     }
     const patch = req.body || {};
-    // Merge into the existing account state (preserve credential from storage).
-    const merged = { ...status, ...patch, enabled: patch.enabled !== undefined ? patch.enabled : true };
-    await connectionRegistry._saveAccount(merged, status.authType);
-    res.json({ success: true, account: accountManager.publicView(merged) });
+    // Merge into the raw stored account. The encrypted credential envelope
+    // is ALWAYS preserved from storage unless the admin explicitly supplies
+    // a replacement credential (apiKey/accessToken/sessionToken/cookies).
+    const merged = { ...raw, ...patch };
+    if (patch.apiKey || patch.accessToken || patch.sessionToken || patch.cookies) {
+      // Credential rotation: build a new plain credential object; it is
+      // encrypted by _saveAccount before persistence.
+      merged.credential = {
+        ...(connectionRegistry._plain(raw).credential || {}),
+        ...(patch.apiKey ? { apiKey: patch.apiKey } : {}),
+        ...(patch.accessToken ? { accessToken: patch.accessToken } : {}),
+        ...(patch.sessionToken ? { sessionToken: patch.sessionToken } : {}),
+        ...(patch.cookies ? { cookies: patch.cookies } : {}),
+      };
+    } else {
+      merged.credential = raw.credential;
+    }
+    delete merged.token;
+    merged.updatedAt = Date.now();
+    if (patch.enabled === undefined) merged.enabled = raw.enabled !== false;
+    await connectionRegistry._saveAccount(merged, raw.authType);
+    // Keep the AccountManager's enhanced in-memory index in sync so routing
+    // strategies (weight/priority/enabled) see the new values immediately.
+    if (accountManager && accountManager._accounts) {
+      const plain = connectionRegistry._plain(merged);
+      const existing = accountManager._accounts.get(id) || {};
+      accountManager._accounts.set(id, { ...existing, ...plain });
+    }
+    res.json({ success: true, account: accountManager.publicView(connectionRegistry._plain(merged)) });
   } catch (err) {
     next(err);
   }
@@ -1305,15 +1729,10 @@ router.put('/accounts/:accountId', async (req, res, next) => {
  */
 router.patch('/accounts/:accountId', async (req, res, next) => {
   try {
-    const id = req.params.accountId;
-    const status = await connectionRegistry.status(id);
-    if (!status || status.state === 'disconnected') {
-      throw new AppError(`Account "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
-    }
-    const patch = req.body || {};
-    const merged = { ...status, ...patch, enabled: patch.enabled !== undefined ? patch.enabled : true };
-    await connectionRegistry._saveAccount(merged, status.authType);
-    res.json({ success: true, account: accountManager.publicView(merged) });
+    // PATCH behaves exactly like PUT (both preserve the stored credential
+    // unless a replacement is supplied) — delegate to the PUT handler.
+    req.method = 'PUT';
+    router.handle(req, res, next);
   } catch (err) {
     next(err);
   }
@@ -1416,12 +1835,12 @@ router.put('/accounts/config/routing', (req, res, next) => {
     if (!providerId || !strategy) {
       throw new AppError('providerId and strategy are required', 400, { code: 'INVALID_REQUEST' });
     }
-    const valid = ['priority', 'fastest', 'weighted', 'round-robin', 'least-used', 'random'];
-    if (!valid.includes(strategy)) {
-      throw new AppError(`Invalid strategy "${strategy}". Valid: ${valid.join(', ')}`, 400, { code: 'INVALID_REQUEST' });
+    const { CONNECTION_STRATEGIES } = require('../config/routingConfig');
+    if (!CONNECTION_STRATEGIES.includes(strategy)) {
+      throw new AppError(`Invalid strategy "${strategy}". Valid: ${CONNECTION_STRATEGIES.join(', ')}`, 400, { code: 'INVALID_REQUEST' });
     }
-    // Store the strategy as a property on the AccountManager's cursor config.
-    accountManager._cursors.set(providerId, { ...(accountManager._cursors.get(providerId) || {}), strategy });
+    // Store the strategy as a per-provider override on the AccountManager.
+    accountManager.setProviderStrategy(providerId, strategy);
     res.json({ success: true, providerId, strategy });
   } catch (err) {
     next(err);
@@ -1450,6 +1869,219 @@ router.get('/accounts', async (req, res, next) => {
   }
 });
 
+// ---------------------------------------------------------------
+// Connection Management (Provider credentials via Dashboard)
+//
+// Connections are provider credentials managed exclusively through the
+// ConnectionManager/ConnectionRegistry + EncryptionService that already
+// exist. Secrets are encrypted at rest, never logged, and never returned
+// in plaintext — responses only ever contain masked views.
+// ---------------------------------------------------------------
+
+// Classify a connectivity/HTTP failure into a stable, secret-free reason.
+function classifyTestError(err) {
+  const status = err && (err.status || (err.info && err.info.status));
+  const code = err && (err.code || (err.info && err.info.code));
+  if (status === 401) return 'Authentication failed (401)';
+  if (status === 403) return 'Access forbidden (403)';
+  if (status === 429) return 'Rate limited (429)';
+  if (status >= 500) return `Upstream server error (${status})`;
+  if (code === 'TIMEOUT' || /timeout/i.test(err && err.message || '')) return 'Connection timed out';
+  if (code === 'NETWORK_ERROR' || code === 'ECONNREFUSED' || code === 'ENOTFOUND') return 'Network error';
+  return (err && err.message ? String(err.message).slice(0, 120) : 'Connection failed')
+    // Never leak secret-looking material in the message.
+    .replace(/(sk|nvapi|pk|key|token|bearer)[-_]?[A-Za-z0-9]{12,}/gi, '********');
+}
+
+// Shared test-connection logic (used by both route shapes).
+async function performConnectionTest(accountId) {
+  const raw = await connectionRegistry._loadAccount(accountId).catch(() => null);
+  if (!raw) return { notFound: true };
+  const plain = connectionRegistry._plain(raw);
+  const provider = providerManager.providersById.get(plain.providerId);
+  const start = Date.now();
+  let ok = false;
+  let reason = null;
+  try {
+    if (!provider || !provider.baseURL) {
+      // No endpoint to probe — validate credential presence/decryptability.
+      ok = !!(plain.credential && (plain.credential.apiKey || plain.credential.accessToken));
+      if (!ok) reason = 'No usable credential material';
+    } else {
+      const axios = require('axios');
+      const cred = plain.credential || {};
+      const apiKey = cred.apiKey || cred.key || cred.token;
+      const resp = await axios.get(`${provider.baseURL.replace(/\/$/, '')}/models`, {
+        timeout: 8000,
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        validateStatus: () => true,
+      });
+      if (resp.status >= 200 && resp.status < 300) {
+        ok = true;
+      } else {
+        const err = new Error(`HTTP ${resp.status}`);
+        err.status = resp.status;
+        throw err;
+      }
+    }
+  } catch (err) {
+    ok = false;
+    reason = classifyTestError(err);
+  }
+  const latencyMs = Date.now() - start;
+  // Record health via the existing AccountManager health tracking.
+  if (ok) accountManager.recordUsage(accountId, { latencyMs });
+  else accountManager.recordFailure(accountId, reason);
+  return { ok, reason, latencyMs, status: raw };
+}
+
+// POST /admin/api/accounts/:accountId/enable | /disable
+// A disabled connection keeps its credential + history but is excluded from
+// every selection strategy (priority/round-robin/weighted/least-used/random)
+// because AccountManager.getAvailableAccounts() filters enabled === false.
+router.post('/accounts/:accountId/:action(enable|disable)', async (req, res, next) => {
+  try {
+    const id = req.params.accountId;
+    const enable = req.params.action === 'enable';
+    const raw = await connectionRegistry._loadAccount(id).catch(() => null);
+    if (!raw) {
+      throw new AppError(`Connection "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const updated = { ...raw, enabled: enable, updatedAt: Date.now() };
+    await connectionRegistry._saveAccount(updated, raw.authType);
+    accountManager._accounts.set(id, { ...accountManager._accounts.get(id), ...updated });
+    require('../utils/logger').info(enable ? 'CONNECTION_ENABLED' : 'CONNECTION_DISABLED', {
+      accountId: id, providerId: raw.providerId,
+    });
+    res.json({ success: true, account: accountManager.publicView(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /admin/api/accounts/:accountId/check — test connectivity using the
+// server-side credential. Never returns the credential.
+router.post('/accounts/:accountId/check', async (req, res, next) => {
+  try {
+    const result = await performConnectionTest(req.params.accountId);
+    if (result.notFound) {
+      throw new AppError(`Connection "${req.params.accountId}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    res.json({
+      success: result.ok,
+      accountId: req.params.accountId,
+      latencyMs: result.latencyMs,
+      error: result.ok ? null : result.reason,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /admin/api/accounts/:accountId/detail — full redacted connection view
+// (metadata + health + usage counters; credential masked).
+router.get('/accounts/:accountId/detail', async (req, res, next) => {
+  try {
+    const id = req.params.accountId;
+    const raw = await connectionRegistry._loadAccount(id).catch(() => null);
+    if (!raw) {
+      throw new AppError(`Connection "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    const health = (accountManager.getHealth() || {})[id] || {};
+    const pub = accountManager.publicView({ ...raw, state: undefined });
+    const status = await connectionRegistry.status(id).catch(() => ({ state: 'unknown' }));
+    res.json({
+      connection: {
+        ...pub,
+        providerId: raw.providerId,
+        status: status.state || pub.status,
+        lastHealthCheck: health.lastUsed || null,
+        successCount: health.successCount || 0,
+        failureCount: health.failureCount || 0,
+        lastLatencyMs: health.lastLatencyMs || null,
+        lastError: health.lastError || null,
+        updatedAt: raw.updatedAt || null,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Nested aliases under /providers/:providerId/connections — the dashboard's
+// canonical shape. They delegate to the same ConnectionManager logic above.
+router.post('/providers/:providerId/connections', async (req, res, next) => {
+  try {
+    const providerId = req.params.providerId;
+    if (!providerManager.providersById.has(providerId)) {
+      throw new AppError(`Provider "${providerId}" not found`, 404, { code: 'PROVIDER_NOT_FOUND' });
+    }
+    const { id, name, apiKey, enabled } = req.body || {};
+    const accountId = id || `${providerId}-${Date.now()}`;
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(accountId)) {
+      throw new AppError('Connection "id" may only contain letters, digits, "-" and "_"', 400, { code: 'INVALID_REQUEST' });
+    }
+    if (await connectionManager.getConnection(accountId)) {
+      throw new AppError(`Connection "${accountId}" already exists`, 409, { code: 'CONFLICT' });
+    }
+    if (!apiKey || typeof apiKey !== 'string') {
+      throw new AppError('A credential "apiKey" is required', 400, { code: 'INVALID_REQUEST' });
+    }
+    const acct = await connectionManager.registerConnection({
+      accountId, providerId, authType: 'api-key', displayName: name || accountId, apiKey, enabled: enabled !== false,
+    });
+    require('../utils/logger').info('CONNECTION_CREATED', { accountId, providerId });
+    res.status(201).json({ success: true, account: acct });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/providers/:providerId/connections', async (req, res, next) => {
+  try {
+    // AccountManager reconciles with the registry/storage on every call.
+    const accounts = await accountManager.listAccounts(req.params.providerId);
+    const health = accountManager.getHealth() || {};
+    res.json({
+      connections: accounts.map((a) => ({ ...a, ...(health[a.id] || {}), credential: undefined })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/providers/:providerId/connections/:connectionId/test', async (req, res, next) => {
+  try {
+    const result = await performConnectionTest(req.params.connectionId);
+    if (result.notFound || result.status.providerId !== req.params.providerId) {
+      throw new AppError(`Connection "${req.params.connectionId}" not found for provider "${req.params.providerId}"`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    res.json({
+      success: result.ok,
+      connectionId: req.params.connectionId,
+      providerId: req.params.providerId,
+      latencyMs: result.latencyMs,
+      error: result.ok ? null : result.reason,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/providers/:providerId/connections/:connectionId/:action(enable|disable)', async (req, res, next) => {
+  try {
+    const raw = await connectionRegistry._loadAccount(req.params.connectionId).catch(() => null);
+    if (!raw || raw.providerId !== req.params.providerId) {
+      throw new AppError(`Connection "${req.params.connectionId}" not found for provider "${req.params.providerId}"`, 404, { code: 'MODEL_NOT_FOUND' });
+    }
+    // Delegate to the flat route logic.
+    req.params.accountId = req.params.connectionId;
+    req.url = `/accounts/${req.params.connectionId}/${req.params.action}`;
+    router.handle(req, res, next);
+  } catch (err) {
+    next(err);
+  }
+});
 
 /**
  * POST /admin/api/providers
@@ -1463,14 +2095,63 @@ router.post('/providers', async (req, res, next) => {
     if (!p.id || typeof p.id !== 'string') {
       throw new AppError('A provider "id" is required', 400, { code: 'INVALID_REQUEST' });
     }
+    // Provider IDs are used in file names, URLs, routing maps and API key
+    // permissions — restrict to a safe slug.
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(p.id)) {
+      throw new AppError(
+        'Provider "id" must be a lowercase slug (letters, digits, "-" and "_", starting with a letter or digit)',
+        400, { code: 'INVALID_REQUEST' }
+      );
+    }
     if (providerManager.providersById.has(p.id)) {
       throw new AppError(`Provider "${p.id}" already exists`, 409, { code: 'CONFLICT' });
+    }
+
+    // Adapter validation: the provider must use a registered adapter so it
+    // never bypasses the ProviderAdapterRegistry / ProviderSDKRegistry.
+    // "generic-openai" is the built-in OpenAI-compatible adapter and is
+    // always available.
+    const knownAdapters = providerAdapterRegistry ? [...providerAdapterRegistry.adapterClasses.keys()] : [];
+    const sdkIds = providerSDKRegistry && typeof providerSDKRegistry.listManifests === 'function'
+      ? providerSDKRegistry.listManifests().map((m) => m.id || m.providerId).filter(Boolean)
+      : [];
+    const adapterId = p.adapter || (knownAdapters.includes(p.id) ? p.id : 'generic-openai');
+    if (p.adapter !== undefined && p.adapter !== null) {
+      if (typeof p.adapter !== 'string' || !p.adapter) {
+        throw new AppError('"adapter" must be a non-empty string', 400, { code: 'INVALID_REQUEST' });
+      }
+      if (!knownAdapters.includes(p.adapter) && !sdkIds.includes(p.adapter)) {
+        throw new AppError(
+          `Unknown adapter "${p.adapter}". Available adapters: ${[...new Set([...knownAdapters, ...sdkIds])].sort().join(', ')}. ` +
+          'Register a new adapter in the ProviderAdapterRegistry / ProviderSDKRegistry before adding this provider.',
+          400, { code: 'INVALID_REQUEST', available: [...new Set([...knownAdapters, ...sdkIds])].sort() }
+        );
+      }
+    }
+
+    // Early baseURL validation (the config validator re-checks this, but we
+    // want a clean 400 before touching disk).
+    if (p.baseURL !== undefined) {
+      try {
+        const url = new URL(p.baseURL);
+        if (!['http:', 'https:'].includes(url.protocol)) {
+          throw new AppError('"baseURL" must use http or https', 400, { code: 'INVALID_REQUEST' });
+        }
+      } catch (err) {
+        if (err instanceof AppError) throw err;
+        throw new AppError(`Invalid "baseURL": "${p.baseURL}"`, 400, { code: 'INVALID_REQUEST' });
+      }
+    }
+
+    // Models validation: must be a non-empty string array.
+    if (!Array.isArray(p.supportedModels) || p.supportedModels.length === 0 || !p.supportedModels.every((m) => typeof m === 'string' && m)) {
+      throw new AppError('"supportedModels" must be a non-empty array of model id strings', 400, { code: 'INVALID_REQUEST' });
     }
 
     const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    const toWrite = { ...p };
+    const toWrite = { ...p, adapter: adapterId, createdAt: p.createdAt || Date.now(), updatedAt: Date.now() };
     delete toWrite.health;
     fs.writeFileSync(path.join(dir, `${p.id}.json`), JSON.stringify(toWrite, null, 2));
 
@@ -1482,7 +2163,9 @@ router.post('/providers', async (req, res, next) => {
         code: 'INVALID_REQUEST', errors: result.errors,
       });
     }
-    res.status(201).json({ success: true, provider: providerManager.providersById.get(p.id) });
+    require('../utils/logger').info('PROVIDER_CREATED', { providerId: p.id, adapter: adapterId });
+    // Never return plaintext credentials — respond with the redacted view.
+    res.status(201).json({ success: true, provider: providerView(providerManager.providersById.get(p.id)) });
   } catch (err) {
     next(err);
   }
@@ -1491,14 +2174,57 @@ router.post('/providers', async (req, res, next) => {
 /**
  * DELETE /admin/api/providers/:id
  *
- * Remove a provider by deleting its config file and reloading.
+ * Safe-delete a provider. Deletion is REFUSED (409) while the provider still
+ * has any of the following, so historical data is never orphaned:
+ *   - active/enabled connections (disable or remove them first)
+ *   - API keys that allow this provider (allowedProviders)
+ *   - recorded usage history
+ * This keeps usage analytics, permissions and audit history intact.
  */
 router.delete('/providers/:id', async (req, res, next) => {
   try {
     const id = req.params.id;
-    if (!providerManager.providersById.has(id)) {
-      throw new AppError(`Provider "${id}" not found`, 404, { code: 'MODEL_NOT_FOUND' });
+    const existing = providerManager.providersById.get(id);
+    if (!existing) {
+      throw new AppError(`Provider "${id}" not found`, 404, { code: 'PROVIDER_NOT_FOUND' });
     }
+
+    const blockers = [];
+
+    // 1. Active connections (disabled ones don't block deletion).
+    let connections = [];
+    try {
+      connections = connectionManager ? await connectionManager.listConnections(id) : [];
+    } catch (_) { connections = []; }
+    const activeConnections = (connections || []).filter((c) => c && c.enabled !== false && c.status !== 'disconnected');
+    if (activeConnections.length > 0) {
+      blockers.push(`${activeConnections.length} active connection(s)`);
+    }
+
+    // 2. API key permissions referencing this provider.
+    const referencingKeys = (apiKeyStore.listKeys() || []).filter(
+      (k) => Array.isArray(k.allowedProviders) && k.allowedProviders.includes(id)
+    );
+    if (referencingKeys.length > 0) {
+      blockers.push(`${referencingKeys.length} API key(s) allow this provider`);
+    }
+
+    // 3. Usage history.
+    const usage = usageAnalyticsService
+      ? usageAnalyticsService.getProviderUsage().find((u) => u.providerId === id)
+      : null;
+    if (usage && (usage.requests || 0) > 0) {
+      blockers.push('usage history exists');
+    }
+
+    if (blockers.length > 0) {
+      throw new AppError(
+        `Provider "${id}" cannot be deleted: ${blockers.join('; ')}. ` +
+        'Disable the provider instead to keep models, credentials, permissions and history.',
+        409, { code: 'CONFLICT', blockers }
+      );
+    }
+
     const dir = providerManager.getConfigDir() || path.join(process.cwd(), 'config', 'providers');
     const file = path.join(dir, `${id}.json`);
     if (fs.existsSync(file)) fs.unlinkSync(file);
@@ -1509,6 +2235,7 @@ router.delete('/providers/:id', async (req, res, next) => {
         code: 'RELOAD_FAILED', errors: result.errors,
       });
     }
+    require('../utils/logger').info('PROVIDER_DELETED', { providerId: id });
     res.json({ success: true });
   } catch (err) {
     next(err);

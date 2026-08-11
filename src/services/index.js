@@ -127,6 +127,11 @@ const modelRouter = new ModelRouter(providerManager, {
   virtualModelRegistry,
 });
 modelRouter.setStrategy(routingConfig.strategy || 'priority');
+// Load model-based routing rules (Dashboard-managed) from
+// config/routingRules.json `modelRules`. They translate into per-model
+// routing overrides (strategy + provider order) — no separate router.
+const { loadModelRoutingRules } = require('../config/routingRulesConfig');
+modelRouter.setModelRules(loadModelRoutingRules());
 const adapterRegistry = new ProviderAdapterRegistry();
 const rateLimiter = new RateLimiter(loadRateLimitConfig(), {
   storageProvider: storageBackend,
@@ -221,7 +226,14 @@ const accountManager = new AccountManager({
   registry: connectionRegistry,
   providerManager,
   httpClient,
+  defaultStrategy: routingConfig.connectionStrategy || 'priority',
 });
+// Apply any per-provider connection strategy overrides from routing.json.
+if (routingConfig.providerStrategies && typeof routingConfig.providerStrategies === 'object') {
+  for (const [pid, sid] of Object.entries(routingConfig.providerStrategies)) {
+    accountManager.setProviderStrategy(pid, sid);
+  }
+}
 const ConnectionManager = require('./connectionManager');
 const connectionManager = new ConnectionManager({
   accountManager,
@@ -322,6 +334,9 @@ requestExecutor.policyAudit = policyAudit;
 // The model router reads `req.policyRouting` to apply force/select decisions
 // post-candidate; expose the engine on the router for that integration.
 modelRouter.policyEngine = policyEngine;
+// Late-bind the ConnectionManager into the router so model-based routing
+// rules can restrict the eligible connection set per model (allow-list).
+modelRouter.connectionManager = connectionManager;
 
 // ProviderConfigManager: hot reload of provider configs.
 // Created after all dependent services so the reload cascade can reach them.
@@ -339,6 +354,9 @@ const providerConfigManager = new ProviderConfigManager({
   discovery,
   virtualModelRegistry,
 });
+// Late-bind the AccountManager so the routing hot-reload cascade can apply
+// connection-level strategies (no init-order cycle).
+providerConfigManager.setAccountManager(accountManager);
 
 // ---- Prompt 23 — Backup & Restore ----
 // BackupService produces versioned, secret-free snapshots and restores API
@@ -353,6 +371,8 @@ const backupService = new BackupService({
   usageAccountant,
   virtualModelRegistry,
   connectionManager,
+  routingConfig,
+  modelRouter,
 }, {
   backupDir: process.env.BACKUP_DIR || null,
   gatewayVersion: process.env.VERSION || '1.0.0',

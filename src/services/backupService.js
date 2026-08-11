@@ -60,6 +60,9 @@ class BackupService {
     this.usageAccountant = deps.usageAccountant || null;
     this.virtualModelRegistry = deps.virtualModelRegistry || null;
     this.connectionManager = deps.connectionManager || null;
+    // Routing state (secret-free): strategy config + model rules.
+    this.routingConfig = deps.routingConfig || null;
+    this.modelRouter = deps.modelRouter || null;
     this.backupDir = opts.backupDir || process.env.BACKUP_DIR || null;
     this.gatewayVersion = opts.gatewayVersion || process.env.VERSION || '1.0.0';
   }
@@ -116,6 +119,8 @@ class BackupService {
       usage: null,
       virtualModels: [],
       connections: [],
+      routing: null,
+      routingRules: [],
     };
 
     // Providers — redacted (no secrets).
@@ -151,6 +156,19 @@ class BackupService {
     // Connection metadata — masked public views only (never credentials).
     if (this.connectionManager && typeof this.connectionManager.listConnections === 'function') {
       try { data.connections = await this.connectionManager.listConnections(); } catch { data.connections = []; }
+    }
+
+    // Routing configuration — secret-free (strategy ids + model rules only).
+    if (this.routingConfig) {
+      data.routing = {
+        strategy: this.routingConfig.strategy || 'priority',
+        connectionStrategy: this.routingConfig.connectionStrategy || 'priority',
+        keySelectionStrategy: this.routingConfig.keySelectionStrategy || 'round-robin',
+        providerStrategies: this.routingConfig.providerStrategies || {},
+      };
+    }
+    if (this.modelRouter && typeof this.modelRouter.listModelRules === 'function') {
+      try { data.routingRules = this.modelRouter.listModelRules(); } catch { data.routingRules = []; }
     }
 
     const createdAt = new Date().toISOString();

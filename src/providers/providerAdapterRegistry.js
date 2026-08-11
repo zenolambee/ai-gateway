@@ -3,6 +3,7 @@ const OpenAIAdapter = require('./openaiAdapter');
 const OpenRouterAdapter = require('./openrouterAdapter');
 const TokenFaucetAdapter = require('./tokenFaucetAdapter');
 const DeepSeekAdapter = require('./deepSeekAdapter');
+const ZenAdapter = require('./zenAdapter');
 const DatabricksAdapter = require('./databricksAdapter');
 const NvidiaAdapter = require('./nvidiaAdapter');
 const GeminiAdapter = require('./geminiAdapter');
@@ -40,6 +41,7 @@ class ProviderAdapterRegistry {
     this.register('openrouter', OpenRouterAdapter);
     this.register('tokenfaucet', TokenFaucetAdapter);
     this.register('deepseek', DeepSeekAdapter);
+    this.register('zen', ZenAdapter);
     this.register('databricks', DatabricksAdapter);
     this.register('nvidia', NvidiaAdapter);
     this.register('gemini', GeminiAdapter);

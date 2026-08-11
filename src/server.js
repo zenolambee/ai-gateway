@@ -3,11 +3,13 @@ const config = require('./config');
 const logger = require('./utils/logger');
 const { providerManager, apiKeyManager, adapterRegistry, refreshScheduler, sdkHealthService, sdkModelDiscovery } = require('./services');
 
-// Validate critical environment configuration
-if (!config.aiApiKey) {
-  console.error('FATAL: AI_API_KEY environment variable is not set. Aborting.');
-  process.exit(1);
-}
+// NOTE (Prompt 28): the Gateway no longer requires a provider credential to be
+// present at startup. Provider credentials (NVIDIA/OpenAI/Anthropic/… API keys,
+// OAuth tokens, etc.) are configured through the Dashboard/ConnectionManager and
+// resolved at request time. A missing provider connection produces a clean
+// per-request error (PROVIDER_NOT_CONFIGURED / NO_API_KEYS) — it never aborts the
+// process. The legacy single-provider `AI_API_KEY` is optional and only used by
+// the deprecated `/api/v1/generate` demo endpoint.
 
 // Load and validate AI provider configurations
 providerManager.load();

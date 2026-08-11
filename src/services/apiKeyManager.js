@@ -98,6 +98,7 @@ class ApiKeyManager {
       : DEFAULT_FAILURE_THRESHOLD;
     this.defaultStrategy = opts.defaultStrategy || 'round-robin';
     this._store = opts.storageProvider || null;
+    this._pendingRestore = null; // Promise of the in-flight storage restore
     this.loaded = false;
   }
 
@@ -159,20 +160,36 @@ class ApiKeyManager {
   }
 
   /** Restore key records, cursors, and configs from storage after load(). */
-  async _restoreFromStorage() {
+  async _restoreFromStorage(epoch) {
     if (!this._store) return;
+    // Abort when a newer load() has superseded this restore.
+    const stale = () => epoch !== undefined && this._loadEpoch !== epoch;
 
     for (const [providerId, records] of this.keysByProvider.entries()) {
+      if (stale()) return;
       // Restore key records
       for (const record of records) {
         try {
           const stored = await this._store.get(this._keyRecordId(providerId, record.value));
+          if (stale()) return;
           if (stored) {
-            if (stored.status) record.status = stored.status;
+            // A persisted COOLDOWN whose window has expired is reconciled to
+            // ACTIVE on the next selection; honour the stored status only
+            // while the cooldown is still in effect so a fresh load() right
+            // after a 429 storm does not resurrect exhausted cooldowns.
+            if (stored.status) {
+              const cooling = stored.status === KeyStatus.COOLDOWN
+                && typeof stored.cooldownUntil === 'number'
+                && Date.now() < stored.cooldownUntil;
+              record.status = stored.status === KeyStatus.COOLDOWN && !cooling ? KeyStatus.ACTIVE : stored.status;
+            }
             if (stored.priority !== undefined) record.priority = stored.priority;
             if (stored.weight !== undefined) record.weight = stored.weight;
             if (stored.stats) Object.assign(record.stats, stored.stats);
-            if (stored.cooldownUntil !== undefined) record.cooldownUntil = stored.cooldownUntil;
+            if (stored.cooldownUntil !== undefined) {
+              record.cooldownUntil = (typeof stored.cooldownUntil === 'number' && Date.now() < stored.cooldownUntil)
+                ? stored.cooldownUntil : null;
+            }
           }
         } catch (_) { /* ignore storage errors during restore */ }
       }
@@ -290,10 +307,18 @@ class ApiKeyManager {
     this.providerConfig = nextConfig;
     this.cursorsByProvider = new Map();
     this.loaded = true;
+    // Monotonic load epoch: bumped on every load(). The async storage
+    // restore below captures the current epoch and only applies persisted
+    // state when no newer load() has run — preventing a stale restore from
+    // clobbering a fresher in-memory state (race fix).
+    this._loadEpoch = (this._loadEpoch || 0) + 1;
+    const epoch = this._loadEpoch;
 
-    // Async restore from storage (fire-and-forget — non-blocking)
+    // Async restore from storage (fire-and-forget — non-blocking). The
+    // in-flight promise is exposed via `whenReady()` so tests / boot code
+    // that need deterministic state can await it instead of racing it.
     if (this._store) {
-      this._restoreFromStorage().then(() => {
+      this._pendingRestore = this._restoreFromStorage(epoch).then(() => {
         logger.info('ApiKeyManager: restored persisted state');
       }).catch((err) => {
         logger.warn('ApiKeyManager: restore failed, using fresh state', { error: err.message });
@@ -306,6 +331,18 @@ class ApiKeyManager {
     });
 
     return this;
+  }
+
+  /**
+   * Resolve when the in-flight async storage restore (started by the last
+   * load()) has completed. Resolves immediately when no restore is pending.
+   * Useful for deterministic tests and boot ordering.
+   * @returns {Promise<void>}
+   */
+  async whenReady() {
+    if (this._pendingRestore) {
+      try { await this._pendingRestore; } catch (_) { /* restore errors already logged */ }
+    }
   }
 
   // ---------------------------------------------------------------
